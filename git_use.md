@@ -10,8 +10,7 @@ git config --global user.email "@ .."
 ```
 3. 리포지토리 내려받기
 ```bash
-git remote add origin https://github.com/dbaledu/lane_detect_challenge.git
-git branch -M main
+git clone https://github.com/dbaledu/lane_detect_challenge.git
 ```
 
 5. 소스 올리기
