@@ -1,5 +1,4 @@
 outputs/
-output/
 *.mp4
 # Byte-compiled / C extensions
 __pycache__/
