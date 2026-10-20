@@ -1,0 +1,214 @@
+"""HUD visualizer for autonomous vision video analysis."""
+import cv2
+import numpy as np
+from typing import List, Optional, Tuple, Dict, Any
+from .data_models import (
+    LaneResult,
+    ObjectBox,
+    RoadMarkingResult,
+    MotionResult,
+    DrivingStateResult,
+    FrameTimings,
+    QualityMetric
+)
+from .geometry import get_roi_polygon
+
+
+class HUDVisualizer:
+    """Renders professional autonomous driving HUD overlays on video frames."""
+
+    def __init__(self, cfg: Optional[Dict[str, Any]] = None):
+        self.cfg = cfg or {}
+        self.vis_cfg = self.cfg.get("visualization", {})
+        self.show_corridor = self.vis_cfg.get("show_lane_polygon", True)
+        self.show_center_path = self.vis_cfg.get("show_center_path", True)
+        self.show_hud_card = self.vis_cfg.get("show_hud_card", True)
+        self.show_debug_minimap = self.vis_cfg.get("show_debug_minimap", True)
+
+    def draw(
+        self,
+        frame: np.ndarray,
+        frame_idx: int,
+        timestamp_sec: float,
+        lane: LaneResult,
+        objects: List[ObjectBox],
+        markings: RoadMarkingResult,
+        motion: MotionResult,
+        state: DrivingStateResult,
+        timings: FrameTimings,
+        quality: QualityMetric,
+        debug_edge_map: Optional[np.ndarray] = None
+    ) -> np.ndarray:
+        """Composes all visual components onto the frame."""
+        h, w = frame.shape[:2]
+        vis = frame.copy()
+        overlay = frame.copy()
+
+        roi_corners = get_roi_polygon(w, h, self.cfg.get("roi"))
+
+        # 1. Draw ROI Boundary (subtle gray)
+        cv2.polylines(overlay, [roi_corners], isClosed=True, color=(70, 70, 70), thickness=1)
+
+        # 2. Draw Driving Corridor & Lane Boundaries
+        if self.show_corridor and lane.left_line and lane.right_line and lane.status != "LOST":
+            lx1, ly1, lx2, ly2 = lane.left_line
+            rx1, ry1, rx2, ry2 = lane.right_line
+            corridor_pts = np.array([[
+                (lx1, ly1), (lx2, ly2), (rx2, ry2), (rx1, ry1)
+            ]], dtype=np.int32)
+
+            # Corridor color changes depending on warning state
+            corridor_color = (0, 200, 0)  # Green
+            if "DECELERATION" in state.ego_state or state.fusion_state == "SLOW_DOWN":
+                corridor_color = (0, 180, 240)  # Amber
+            elif "STOP" in state.ego_state or state.fusion_state == "STOP_REQUIRED":
+                corridor_color = (40, 40, 220)  # Red
+
+            cv2.fillPoly(overlay, corridor_pts, corridor_color)
+
+        # Alpha blend corridor overlay
+        vis = cv2.addWeighted(overlay, 0.30, vis, 0.70, 0)
+
+        # Draw Left/Right Lane lines on top of blend
+        if lane.left_line:
+            lx1, ly1, lx2, ly2 = lane.left_line
+            cv2.line(vis, (lx1, ly1), (lx2, ly2), (255, 120, 0), 4, cv2.LINE_AA)
+        if lane.right_line:
+            rx1, ry1, rx2, ry2 = lane.right_line
+            cv2.line(vis, (rx1, ry1), (rx2, ry2), (0, 100, 255), 4, cv2.LINE_AA)
+
+        # Draw Center Driving Path
+        if self.show_center_path and lane.lane_center_x is not None and lane.status != "LOST":
+            cx = int(lane.lane_center_x)
+            top_y = int(roi_corners[0][0][1])
+            bot_y = int(roi_corners[0][3][1])
+            # Dashed center line
+            for y in range(top_y, bot_y, 16):
+                cv2.line(vis, (cx, y), (cx, min(bot_y, y + 8)), (0, 255, 180), 2, cv2.LINE_AA)
+            # Vehicle bottom frame center marker
+            frame_center_x = w // 2
+            cv2.circle(vis, (frame_center_x, bot_y), 6, (255, 255, 0), -1)
+            cv2.line(vis, (frame_center_x, bot_y), (cx, bot_y), (0, 255, 255), 2)
+
+        # 3. Draw Road Markings (Crosswalks and Stoplines)
+        if markings.crosswalk_detected:
+            for cbox in markings.crosswalk_boxes:
+                bx1, by1, bx2, by2 = cbox
+                cv2.rectangle(vis, (bx1, by1), (bx2, by2), (0, 240, 240), 2)
+                cv2.putText(vis, "CROSSWALK", (bx1, max(18, by1 - 6)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 240, 240), 1, cv2.LINE_AA)
+
+        if markings.stopline_detected:
+            for sbox in markings.stopline_boxes:
+                bx1, by1, bx2, by2 = sbox
+                cv2.rectangle(vis, (bx1, by1), (bx2, by2), (0, 0, 255), 3)
+                cv2.putText(vis, "STOPLINE", (bx1, max(18, by1 - 6)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2, cv2.LINE_AA)
+
+        # 4. Draw Detected Objects
+        for obj in objects:
+            x1, y1, x2, y2 = obj.bbox
+            if obj.is_on_crosswalk:
+                box_color = (0, 69, 255)  # High-visibility Red-Orange for pedestrians on crosswalk
+                box_thickness = 3
+                tag = f"CROSSWALK PED #{obj.track_id} {obj.confidence:.2f}"
+            elif obj.is_lead:
+                box_color = (0, 0, 255)  # Red for lead vehicle
+                box_thickness = 3
+                tag = f"LEAD CAR #{obj.track_id} [{obj.status}|{obj.relative_distance_trend}]"
+            elif obj.label == "person":
+                box_color = (0, 255, 255)  # Yellow for pedestrians
+                box_thickness = 2
+                tag = f"PED #{obj.track_id} {obj.confidence:.2f}"
+            else:
+                box_color = (255, 180, 0)  # Cyan/Blue for other vehicles
+                box_thickness = 2
+                tag = f"{obj.label} #{obj.track_id}"
+
+            cv2.rectangle(vis, (x1, y1), (x2, y2), box_color, box_thickness)
+            # Label tag background
+            (tw, th), _ = cv2.getTextSize(tag, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+            cv2.rectangle(vis, (x1, max(0, y1 - th - 6)), (x1 + tw + 6, max(th + 6, y1)), box_color, -1)
+            cv2.putText(vis, tag, (x1 + 3, max(th, y1 - 3)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1, cv2.LINE_AA)
+
+        # 5. Draw HUD Dashboard Card (Top Left)
+        if self.show_hud_card:
+            card_w, card_h = 380, 195
+            card_x, card_y = 15, 15
+
+            # Translucent dark background
+            hud_sub = vis[card_y:card_y + card_h, card_x:card_x + card_w]
+            hud_bg = np.zeros_like(hud_sub)
+            cv2.rectangle(hud_bg, (0, 0), (card_w, card_h), (25, 25, 25), -1)
+            vis[card_y:card_y + card_h, card_x:card_x + card_w] = cv2.addWeighted(hud_sub, 0.25, hud_bg, 0.75, 0)
+            cv2.rectangle(vis, (card_x, card_y), (card_x + card_w, card_y + card_h), (120, 120, 120), 1)
+
+            # Header
+            cv2.putText(vis, "DASHCAM VISION SYSTEM", (card_x + 12, card_y + 22),
+                        cv2.FONT_HERSHEY_DUPLEX, 0.55, (240, 240, 240), 1, cv2.LINE_AA)
+            cv2.line(vis, (card_x + 10, card_y + 28), (card_x + card_w - 10, card_y + 28), (80, 80, 80), 1)
+
+            # Frame & Timestamp & FPS
+            eff_fps = (1000.0 / timings.total_ms) if timings.total_ms > 0 else 0.0
+            info_str = f"F#{frame_idx:04d} | {timestamp_sec:.2f}s | {eff_fps:4.1f} FPS ({timings.total_ms:4.1f}ms)"
+            cv2.putText(vis, info_str, (card_x + 12, card_y + 46),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1, cv2.LINE_AA)
+
+            # Ego State Badge
+            state_color = (0, 200, 0)  # Green
+            if "DECELERATION" in state.ego_state:
+                state_color = (0, 165, 255)  # Orange
+            elif "STOPPED" in state.ego_state:
+                state_color = (50, 50, 255)  # Red
+            elif "START" in state.ego_state:
+                state_color = (255, 220, 0)  # Cyan
+            elif "UNCERTAIN" in state.ego_state:
+                state_color = (150, 150, 150)
+
+            ego_text = f"EGO: {state.ego_state}"
+            cv2.putText(vis, ego_text, (card_x + 12, card_y + 70),
+                        cv2.FONT_HERSHEY_DUPLEX, 0.52, state_color, 1, cv2.LINE_AA)
+
+            # Lead Vehicle State
+            lead_color = (255, 100, 100) if state.lead_state in ("STOPPED", "APPROACHING") else (180, 220, 180)
+            cv2.putText(vis, f"LEAD: {state.lead_state} | LC: {state.lane_change_status}", (card_x + 12, card_y + 92),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, lead_color, 1, cv2.LINE_AA)
+
+            # Fusion State & Reason
+            cv2.putText(vis, f"DECISION: {state.fusion_state}", (card_x + 12, card_y + 115),
+                        cv2.FONT_HERSHEY_DUPLEX, 0.5, (0, 230, 255), 1, cv2.LINE_AA)
+            reason_trunc = state.reason if len(state.reason) < 40 else state.reason[:38] + ".."
+            cv2.putText(vis, f"  -> {reason_trunc}", (card_x + 12, card_y + 135),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.40, (220, 220, 220), 1, cv2.LINE_AA)
+
+            # Lane Status & Offset
+            lane_str = f"LANE: {lane.status} (conf:{lane.lane_confidence:.2f})"
+            err_str = f"Δx:{int(lane.lane_error_px):+d}px" if lane.lane_error_px is not None else "Δx:N/A"
+            cv2.putText(vis, f"{lane_str} | {err_str}", (card_x + 12, card_y + 158),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 240, 180), 1, cv2.LINE_AA)
+
+            # Motion & Lighting
+            night_tag = "NIGHT" if quality.is_night else "DAY"
+            cv2.putText(vis, f"FLOW: {motion.magnitude:.2f} px/f | LIGHT: {night_tag} (br:{quality.brightness:.0f})",
+                        (card_x + 12, card_y + 180),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.40, (190, 190, 190), 1, cv2.LINE_AA)
+
+        # 6. Draw Debug Minimap (Top Right)
+        if self.show_debug_minimap and debug_edge_map is not None:
+            mw, mh = int(w * 0.24), int(h * 0.22)
+            mx = w - mw - 15
+            my = 15
+
+            if len(debug_edge_map.shape) == 2:
+                mini_bgr = cv2.cvtColor(debug_edge_map, cv2.COLOR_GRAY2BGR)
+            else:
+                mini_bgr = debug_edge_map.copy()
+
+            mini_resized = cv2.resize(mini_bgr, (mw, mh))
+            vis[my:my + mh, mx:mx + mw] = mini_resized
+            cv2.rectangle(vis, (mx, my), (mx + mw, my + mh), (0, 220, 255), 2)
+            cv2.putText(vis, "ROI Edge Map", (mx + 8, my + 18),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 220, 255), 1, cv2.LINE_AA)
+
+        return vis
