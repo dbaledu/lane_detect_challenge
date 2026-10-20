@@ -60,7 +60,7 @@ lane_change:
 detector:
   enabled: true
   backend: "auto"           # "ultralytics", "opencv_dnn", "none", "auto"
-  model_name: "yolov8n.pt"  # 경량 Nano 모델 (yolov8n.pt, yolo11n.pt)
+  model_name: "yolo26n.pt"  # 경량 Nano 모델 (yolov8n.pt, yolo11n.pt)
   confidence_threshold: 0.35
   person_confidence_threshold: 0.22 # 횡단보도/도로 위 보행자 검출 전용 낮은 임계값
   iou_threshold: 0.45

@@ -3,5 +3,5 @@ numpy>=1.23.0
 pyyaml>=6.0
 pandas>=2.0.0
 # Optional lightweight deep learning detection backend:
-# ultralytics>=8.0.0
-# torch>=2.0.0
+ultralytics>=8.0.0
+torch>=2.0.0

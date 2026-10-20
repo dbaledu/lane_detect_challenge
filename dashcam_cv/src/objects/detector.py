@@ -72,10 +72,12 @@ class ObjectDetector:
 
         boxes: List[ObjectBox] = []
 
-        if self.backend == "ultralytics" and self.yolo_model is not None:
-            boxes = self._detect_yolo(frame)
-        else:
-            boxes = self._detect_opencv_fallback(frame)
+        # if self.backend == "ultralytics" and self.yolo_model is not None:
+        #     boxes = self._detect_yolo(frame)
+        # else:
+        #     boxes = self._detect_opencv_fallback(frame)
+        # 수정일자 2026/10/20 yolo 모델을 항상 사용하도록 변경
+        boxes = self._detect_yolo(frame)
 
         self.cached_boxes = boxes
         return boxes, True
