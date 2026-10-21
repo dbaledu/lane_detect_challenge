@@ -89,11 +89,15 @@
 ### 1) 환경 준비
 ```bash
 # 가상환경 생성 (권장)
-python -m venv .venv
-.venv\Scripts\activate
+#python -m venv .venv
+#.venv\Scripts\activate
 
 # 의존성 설치
+# dashcam_cv 폴더에서 실행할 것
 pip install -r requirements.txt
+
+# 테스트 영상 복사
+# data 폴더에 Test_Video_2.mp4 파일 복사
 ```
 *(선택사항) GPU 또는 최신 YOLO 가중치를 활용하려면 `pip install ultralytics`를 설치하면 자동으로 YOLO 백엔드가 활성화됩니다.*
 
