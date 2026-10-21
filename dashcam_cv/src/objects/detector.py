@@ -10,7 +10,8 @@ COCO_CLASS_NAMES = {
     2: "car",
     3: "motorcycle",
     5: "bus",
-    7: "truck"
+    7: "truck",
+    9: "traffic light"
 }
 
 
@@ -28,7 +29,7 @@ class ObjectDetector:
         self.person_conf_th = float(det_cfg.get("person_confidence_threshold", 0.22))
         self.iou_th = float(det_cfg.get("iou_threshold", 0.45))
         self.interval = max(1, int(det_cfg.get("detect_interval", 5)))
-        self.target_classes = set(det_cfg.get("target_classes", [0, 1, 2, 3, 5, 7]))
+        self.target_classes = set(det_cfg.get("target_classes", [0, 1, 2, 3, 5, 7, 9]))
 
         self.yolo_model = None
         self.cached_boxes: List[ObjectBox] = []

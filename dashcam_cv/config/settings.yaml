@@ -65,7 +65,7 @@ detector:
   person_confidence_threshold: 0.22 # 횡단보도/도로 위 보행자 검출 전용 낮은 임계값
   iou_threshold: 0.45
   detect_interval: 5        # N프레임마다 1회 추론 (중간 프레임은 트래커 보간)
-  target_classes: [0, 1, 2, 3, 5, 7] # person, bicycle, car, motorcycle, bus, truck
+  target_classes: [0, 1, 2, 3, 5, 7, 9] # person, bicycle, car, motorcycle, bus, truck, traffic light
 
 # 8. 객체 추적기 설정 (Centroid & IoU 기반 경량 트래커)
 tracker:
