@@ -108,8 +108,8 @@ python src/main.py --input data/Test_video_1.mp4 --width 960 --detect-interval 5
 # 실시간 GUI 창 활성화 (q: 종료, p: 일시정지, d: 미니맵 토글)
 python src/main.py --display
 
-# 빠른 벤치마크 테스트 (앞쪽 100프레임만 처리)
-python src/main.py --max-frames 100 --no-display
+# 빠른 벤치마크 테스트 (앞쪽 100프레임만 처리)ㅎ
+python src/main.py --max-frames 100 --no-displayq
 ```
 
 ### 3) 단위 테스트 실행
