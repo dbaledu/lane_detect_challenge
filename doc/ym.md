@@ -217,3 +217,50 @@ ObjectBox(
 - `반환값` -> np.ndarray: 시각화 요소가 그려진 출력 프레임입니다. 원본 frame을 직접 수정하는 대신 복사본에 그려 반환합니다.
 
 
+## 성능 분석
+```python
+ "performance": {
+    "processed_frames": 678,
+    "effective_processing_fps": 46.27,   # 처리한 프레임 하나당 평균 지연시간을 밀리초(ms)
+    "mean_total_ms": 21.61,
+    "p95_total_ms": 45.14,
+    "module_latency_mean_ms": {   # 처리한 프레임 하나당 평균 지연시간(ms)
+      "decode": 0.0,
+      "preprocess": 7.13,
+      "lane": 2.18,
+      "detect": 7.55,
+      "tracking": 0.15,
+      "motion": 2.28,
+      "decision": 0.05,
+      "render": 1.19
+    }
+```
+
+
+. `module_latency_mean_ms`의 각 수치는 **처리한 프레임 하나당 평균 지연시간을 밀리초(ms)로 나타낸 것**입니다. `mean_total_ms`와 `p95_total_ms`도 프레임 처리시간이며, `effective_processing_fps`만 **초당 처리 프레임 수(FPS)**입니다.
+
+|항목|값|의미|
+|---|--:|---|
+|`processed_frames`|678|실제 처리한 프레임 수|
+|`effective_processing_fps`|46.27 FPS|초당 평균 처리 프레임 수|
+|`mean_total_ms`|21.61ms|프레임 한 장을 처리하는 데 걸린 평균 시간|
+|`p95_total_ms`|45.14ms|처리 프레임의 95%가 이 시간 이내에 완료됨. 나머지 5%는 더 오래 걸림|
+|`decode`|0.00ms|영상 프레임 디코딩 시간. 0으로 측정됐거나 반올림·측정 범위에서 제외됐을 수 있어, 디코딩 작업이 실제로 전혀 없었다고 단정할 수는 없음|
+|`preprocess`|7.13ms|프레임 크기 조정 등 모델 입력을 위한 전처리|
+|`lane`|2.18ms|차선 검출 처리|
+|`detect`|7.55ms|객체 검출 처리|
+|`tracking`|0.15ms|객체 추적 및 ID 갱신|
+|`motion`|2.28ms|움직임 분석|
+|`decision`|0.05ms|검출 결과를 바탕으로 한 주행 판단|
+|`render`|1.19ms|결과를 프레임 위에 그리는 시각화|
+
+평균 총 처리시간 `21.61ms`를 FPS로 환산하면 약 **46.3 FPS**이므로, `effective_processing_fps`와 거의 일치합니다. 모듈별 평균을 더하면 약 **20.53ms**로 총 시간보다 조금 짧은데, 측정 범위에 차이가 있거나 모듈별 시간에 포함되지 않는 오버헤드가 있을 수 있습니다.
+
+
+## 표시전용 EMA(Exponential Moving Average) 평활화
+- EMA(Exponential Moving Average) : 지수이동평균
+자율주행 영상 분석에서 표시전용 EMA 평활화는 객체의 실제 검출 결과는 그대로 유지하면서, 화면에 표시하는 위치나 값을 부드럽게 만드는 기법입니다
+- 또한 객체 ID가 바뀌거나 객체가 오랫동안 검출되지 않았다가 다시 나타나는 경우에는 이전 EMA 값을 초기화하거나 재연결 여부를 확인
+- 추적기에서 나온 detected_box를 변경하지 않고, display_box만 시각화에 사용
+
+![alt text](images/detect08.png)
