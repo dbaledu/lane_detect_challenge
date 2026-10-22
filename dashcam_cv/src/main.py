@@ -22,6 +22,11 @@ from src.video.quality_analyzer import QualityAnalyzer
 from src.lane.lane_detector import LaneDetector
 from src.lane.lane_tracker import LaneTracker
 from src.lane.lane_change import LaneChangeDetector
+from src.lane.lanes_detector_v1_EM import (
+    ADASLaneTrackerV3,
+    CrosswalkAndMotionDetector,
+    process_frame as expert_process_frame,
+)
 from src.objects.detector import ObjectDetector
 from src.objects.object_tracker import ObjectTracker
 from src.objects.road_markings import RoadMarkingDetector
@@ -113,6 +118,14 @@ def run_pipeline(cfg: dict, args: argparse.Namespace):
     lane_detector = LaneDetector(cfg)
     lane_tracker = LaneTracker(cfg)
     lane_change_detector = LaneChangeDetector(cfg)
+
+    # detect_lanes_v4_expert 전용 상태 객체
+    expert_tracker = ADASLaneTrackerV3()
+    expert_crosswalk_detector = CrosswalkAndMotionDetector(
+        w=meta.target_width, h=meta.target_height
+    )
+    expert_clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+    expert_prev_gray_roi = None
     object_detector = ObjectDetector(cfg)
     object_tracker = ObjectTracker(cfg)
     road_markings = RoadMarkingDetector(cfg)
@@ -153,12 +166,18 @@ def run_pipeline(cfg: dict, args: argparse.Namespace):
             quality = quality_analyzer.analyze(frame, gray)
             t_preprocess = (time.perf_counter() - t0) * 1000.0
 
-            # Lane Detection & Tracking
+            # Lane Detection & Tracking (detect_lanes_v4_expert)
             t0 = time.perf_counter()
-            lines, roi_edges = lane_detector.detect_lines(edges, roi_corners)
-            raw_left, raw_right, raw_conf = lane_detector.filter_and_fit(
-                lines, meta.target_width, meta.target_height
+            frame, roi_edges, expert_status, expert_gray_roi = expert_process_frame(
+                frame,
+                expert_tracker,
+                expert_crosswalk_detector,
+                expert_clahe,
+                prev_gray_roi=expert_prev_gray_roi,
             )
+            expert_prev_gray_roi = expert_gray_roi
+            # 기존 파이프라인 호환을 위해 레거시 변수 유지
+            lines, raw_left, raw_right, raw_conf = None, None, None, 0.0
             lane_res = lane_tracker.update(
                 raw_left, raw_right, raw_conf, meta.target_width, meta.target_height
             )
