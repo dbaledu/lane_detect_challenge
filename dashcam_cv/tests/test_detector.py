@@ -8,7 +8,16 @@ import numpy as np
 # Ensure project root is on sys.path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.common.data_models import ObjectBox, LaneResult
+from src.common.data_models import (
+    ObjectBox,
+    LaneResult,
+    RoadMarkingResult,
+    MotionResult,
+    DrivingStateResult,
+    FrameTimings,
+    QualityMetric,
+)
+from src.common.visualizer import HUDVisualizer
 from src.objects.detector import ObjectDetector
 from src.objects.object_tracker import ObjectTracker
 from src.objects.road_markings import RoadMarkingDetector
@@ -94,6 +103,41 @@ class TestDetectorModule(unittest.TestCase):
         self.assertTrue(res.stopline_detected)
         self.assertIsNotNone(res.stopline_y)
         self.assertAlmostEqual(res.stopline_y, y_stop, delta=5)
+
+    def test_visualizer_show_object_labels_toggle(self):
+        """Tests that object labels can be toggled on/off via configuration."""
+        obj = ObjectBox(
+            track_id=1,
+            bbox=(100, 100, 200, 200),
+            class_id=2,
+            label="car",
+            confidence=0.9,
+            center=(150.0, 150.0)
+        )
+        frame = np.zeros((self.h, self.w, 3), dtype=np.uint8)
+        common_kwargs = dict(
+            frame=frame,
+            frame_idx=0,
+            timestamp_sec=0.0,
+            lane=LaneResult(status="LOST"),
+            objects=[obj],
+            markings=RoadMarkingResult(),
+            motion=MotionResult(magnitude=0.0),
+            state=DrivingStateResult(ego_state="STOPPED"),
+            timings=FrameTimings(),
+            quality=QualityMetric(brightness=100.0, blur_score=100.0, is_night=False, is_blurred=False)
+        )
+
+        # 1. With labels enabled
+        cfg_with_labels = {"visualization": {"show_object_labels": True, "show_hud_card": False}}
+        vis_with_labels = HUDVisualizer(cfg_with_labels).draw(**common_kwargs)
+
+        # 2. With labels disabled
+        cfg_no_labels = {"visualization": {"show_object_labels": False, "show_hud_card": False}}
+        vis_no_labels = HUDVisualizer(cfg_no_labels).draw(**common_kwargs)
+
+        # The image without labels should differ from the image with labels
+        self.assertFalse(np.array_equal(vis_with_labels, vis_no_labels))
 
 
 if __name__ == "__main__":

@@ -24,6 +24,11 @@ class HUDVisualizer:
         self.show_center_path = self.vis_cfg.get("show_center_path", True)
         self.show_hud_card = self.vis_cfg.get("show_hud_card", True)
         self.show_debug_minimap = self.vis_cfg.get("show_debug_minimap", True)
+        self.show_objects = self.vis_cfg.get("show_objects", True)
+        self.show_object_labels = self.vis_cfg.get(
+            "show_object_labels",
+            self.vis_cfg.get("show_box_labels", self.cfg.get("detector", {}).get("show_labels", True))
+        )
 
     def draw(
         self,
@@ -106,31 +111,34 @@ class HUDVisualizer:
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2, cv2.LINE_AA)
 
         # 4. Draw Detected Objects
-        for obj in objects:
-            x1, y1, x2, y2 = obj.bbox
-            if obj.is_on_crosswalk:
-                box_color = (0, 69, 255)  # High-visibility Red-Orange for pedestrians on crosswalk
-                box_thickness = 3
-                tag = f"CROSSWALK PED #{obj.track_id} {obj.confidence:.2f}"
-            elif obj.is_lead:
-                box_color = (0, 0, 255)  # Red for lead vehicle
-                box_thickness = 3
-                tag = f"LEAD CAR #{obj.track_id} [{obj.status}|{obj.relative_distance_trend}]"
-            elif obj.label == "person":
-                box_color = (0, 255, 255)  # Yellow for pedestrians
-                box_thickness = 2
-                tag = f"PED #{obj.track_id} {obj.confidence:.2f}"
-            else:
-                box_color = (255, 180, 0)  # Cyan/Blue for other vehicles
-                box_thickness = 2
-                tag = f"{obj.label} #{obj.track_id}"
+        if self.show_objects:
+            for obj in objects:
+                x1, y1, x2, y2 = obj.bbox
+                if obj.is_on_crosswalk:
+                    box_color = (0, 69, 255)  # High-visibility Red-Orange for pedestrians on crosswalk
+                    box_thickness = 3
+                    tag = f"CROSSWALK PED #{obj.track_id} {obj.confidence:.2f}"
+                elif obj.is_lead:
+                    box_color = (0, 0, 255)  # Red for lead vehicle
+                    box_thickness = 3
+                    tag = f"LEAD CAR #{obj.track_id} [{obj.status}|{obj.relative_distance_trend}]"
+                elif obj.label == "person":
+                    box_color = (0, 255, 255)  # Yellow for pedestrians
+                    box_thickness = 2
+                    tag = f"PED #{obj.track_id} {obj.confidence:.2f}"
+                else:
+                    box_color = (255, 180, 0)  # Cyan/Blue for other vehicles
+                    box_thickness = 2
+                    tag = f"{obj.label} #{obj.track_id}"
 
-            cv2.rectangle(vis, (x1, y1), (x2, y2), box_color, box_thickness)
-            # Label tag background
-            (tw, th), _ = cv2.getTextSize(tag, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
-            cv2.rectangle(vis, (x1, max(0, y1 - th - 6)), (x1 + tw + 6, max(th + 6, y1)), box_color, -1)
-            cv2.putText(vis, tag, (x1 + 3, max(th, y1 - 3)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1, cv2.LINE_AA)
+                cv2.rectangle(vis, (x1, y1), (x2, y2), box_color, box_thickness)
+                # 박태훈 10/23 수정. 객체 라벨 표시여부 제어(on/off) 
+                if self.show_object_labels:
+                    # Label tag background
+                    (tw, th), _ = cv2.getTextSize(tag, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+                    cv2.rectangle(vis, (x1, max(0, y1 - th - 6)), (x1 + tw + 6, max(th + 6, y1)), box_color, -1)
+                    cv2.putText(vis, tag, (x1 + 3, max(th, y1 - 3)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1, cv2.LINE_AA)
 
         # 5. Draw HUD Dashboard Card (Top Left)
         if self.show_hud_card:
