@@ -98,6 +98,44 @@ class TestLaneModule(unittest.TestCase):
         self.assertIsNone(res_lost.left_line)
         self.assertIsNone(res_lost.right_line)
 
+    def test_cv1021_dual_roi_geometry(self):
+        """Tests cv1021.py dual ROI geometry and bounding box shrinking."""
+        detector = LaneDetector(self.cfg)
+        (l_corners, l_bbox), (r_corners, r_bbox) = detector.get_dual_roi_geometry(self.h, self.w)
+        self.assertEqual(l_corners.shape, (1, 4, 2))
+        self.assertEqual(r_corners.shape, (1, 4, 2))
+        self.assertEqual(len(l_bbox), 4)
+        self.assertEqual(len(r_bbox), 4)
+        # Left bbox should be to the left of right bbox
+        self.assertLess(l_bbox[2], r_bbox[0])
+
+    def test_cv1021_kalman_filter_innovation_gating(self):
+        """Tests SingleLaneKalmanFilter innovation gating against sudden jumps."""
+        from src.lane.lane_tracker import SingleLaneKalmanFilter
+        kf = SingleLaneKalmanFilter(dt=1.0, max_lost_frames=10)
+        # Initial measurement
+        fit, lost = kf.update([-0.5, 400.0])
+        self.assertEqual(lost, 0)
+        self.assertAlmostEqual(fit[0], -0.5, places=2)
+
+        # Normal small change
+        fit, lost = kf.update([-0.51, 402.0])
+        self.assertEqual(lost, 0)
+
+        # Extreme jump (diff_c > 160 or diff_m > 0.45) -> should be gated out
+        fit, lost = kf.update([0.8, 700.0])
+        self.assertEqual(lost, 1)  # Gated: lost_frames incremented
+        self.assertAlmostEqual(fit[0], -0.51, delta=0.1)  # Maintained previous prediction
+
+    def test_cv1021_unpack_compatibility(self):
+        """Tests unpacking LaneResult as (left_fit, right_fit, lost_frames) like cv1021.py."""
+        tracker = LaneTracker(self.cfg)
+        smooth_l, smooth_r, lost_cnt = tracker.update([-0.5, 400], [0.5, 500], 1.0, self.w, self.h)
+        self.assertIsNotNone(smooth_l)
+        self.assertIsNotNone(smooth_r)
+        self.assertEqual(lost_cnt, 0)
+
 
 if __name__ == "__main__":
     unittest.main()
+
