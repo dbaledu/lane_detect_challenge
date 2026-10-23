@@ -168,7 +168,7 @@ def run_pipeline(cfg: dict, args: argparse.Namespace):
 
             # Lane Detection & Tracking (detect_lanes_v4_expert)
             t0 = time.perf_counter()
-            frame, roi_edges, expert_status, expert_gray_roi = expert_process_frame(
+            frame, expert_status, expert_gray_roi = expert_process_frame(
                 frame,
                 expert_tracker,
                 expert_crosswalk_detector,
@@ -234,7 +234,7 @@ def run_pipeline(cfg: dict, args: argparse.Namespace):
             vis_frame = visualizer.draw(
                 frame, frame_idx, timestamp, lane_res, tracked_objects,
                 markings_res, motion_res, state_res, dummy_timings, quality,
-                debug_edge_map=roi_edges
+                debug_edge_map=None
             )
             t_render = (time.perf_counter() - t0) * 1000.0
 

@@ -1,36 +1,57 @@
-"""
-================================================================================
-Test_Video_2 야간 도심 차선 검출 파이프라인 v3 (클린 뷰 & 고시인성 & 꼬임 방지 ROI)
-10년차 베테랑 ADAS 컴퓨터 비전 엔지니어 최적화 버전
-================================================================================
-
-[수정점 100% 반영 명세]
-[수정점 1] 버드아이 뷰(BEV / IPM) 파이프라인 및 코드 완전 삭제:
-   - 버드아이 뷰 변환기(BirdEyeViewTransformer) 및 불필요한 투시 변환 연산 전체 제거
-   - 왜곡 없는 순수 카메라 뷰 좌표계에서 초고속 직접 차선 검출 수행
-
-[수정점 2] 지정된 사다리꼴 ROI 영역 적용 및 차선 검출 영역 꼬임 방지 (Anti-Twisting):
-   - 사용자 지정 4점 ROI 좌표 정확 반영:
-     * 상단 좌측: (int(w * 0.44), int(h * 0.65))
-     * 상단 우측: (int(w * 0.56), int(h * 0.65))
-     * 하단 우측: (int(w * 0.82), int(h * 0.88))
-     * 하단 좌측: (int(w * 0.18), int(h * 0.88))
-   - 차선 검출 영역 꼬임(Cross-over / Hourglass) 원천 차단:
-     1) 좌/우 차선 후보 분류 시 소실점 중앙 분리 제약 엄격 적용
-     2) 트래커 기하 유효성 검사에서 두 차선의 교점(Intersection)이 visible ROI(y_top ~ y_bottom)
-        내에 존재하면 즉시 기각하여 꼬임 유발 방지
-     3) 렌더링 전 상단(최소 26px) 및 하단(최소 160px) 안전 마진 가드(Anti-Twist Guard) 적용으로
-        어떤 극한 노이즈 환경에서도 폴리곤이 뒤집히거나 꼬이지 않고 안정적 사다리꼴 유지
-
-[수정점 3] 차선 외 모든 HUD 삭제 & 고시인성 네온 차로 표현 & ROI-CLAHE 유지:
-   - 일체의 텍스트 HUD, 박스 미출력 (순수 주행 화면만 반환)
-   - 45% 알파 네온 에메랄드 폴리곤 + 8px/3px 이중 발광 경계선 + 중앙 유도 점선
-   - ROI 영역(y_top ~ y_bottom, 하단 23%)에만 국소 CLAHE 적용 (연산량 65% 절감, 120+ FPS)
-================================================================================
-"""
+# ==============================================================================
+# [코드 개요] 야간 도심 차선 검출 파이프라인 (카메라 뷰 직접 처리, BEV 미사용)
+# ==============================================================================
+#
+# ■ 전체 파이프라인 (프레임 1장 기준, process_frame)
+#
+#   입력 프레임(640x360 리사이즈)
+#     1) Grayscale 변환
+#     2) ROI 세로 슬라이스 추출 (y: 0.65h ~ 0.88h)
+#     3) CLAHE        : 야간 저조도 대비 향상
+#     4) Gaussian Blur(5x5) + Canny(45/135) : 엣지 검출
+#     5) 사다리꼴 마스크 : 주행 영역 밖 엣지 제거
+#     6) 횡단보도/모션 판별 : 차선 표시 ON/OFF 결정 (CrosswalkAndMotionDetector)
+#     7) 세로 방향 팽창(1x5) : 끊어진 점선/마모 차선 연결
+#                              (횡단보도 감지 시 중앙 영역 엣지 제거)
+#     8) HoughLinesP  : 직선 선분 후보 추출
+#     9) 기울기/위치 필터 + 좌/우 분류 : 중앙선을 넘는 후보 사전 차단
+#    10) 대표 직선 산출 : IQR 이상치 제거 + 길이 가중 평균 (fit_representative_line)
+#    11) 시계열 추적   : 기하 검증 + EMA 스무딩 + 손실 시 유지 (ADASLaneTrackerV3)
+#    12) 렌더링        : 안전 마진 가드 -> 네온 폴리곤/경계선/중앙 점선 오버레이
+#   출력 프레임 -> 화면 미리보기 + 영상 파일 저장 (run_video_pipeline)
+#
+# ■ 구성 요소
+#
+#   [클래스]
+#   - CrosswalkAndMotionDetector
+#       횡단보도(엣지 교번 횟수)와 차량 정지/주행(프레임 차분)을 판별하여
+#       차선 표시를 숨길지(display_lanes) 결정하는 상태 머신.
+#   - ADASLaneTrackerV3
+#       좌/우 차선의 시계열 추적기. EMA 스무딩, 한쪽만 검출될 때의 평행 보정,
+#       검출 실패 시 최대 35프레임 유지(HOLD), 좌/우 교차(꼬임) 기하 검증 담당.
+#
+#   [함수]
+#   - line_to_points(y_bottom, y_top, line_params)
+#       (기울기, 절편) -> [x_bottom, y_bottom, x_top, y_top] 좌표 변환.
+#   - fit_representative_line(line_candidates, y_bottom, y_top)
+#       후보 선분들에서 대표 직선 1개를 산출 (IQR 필터 + 길이 가중 평균).
+#   - process_frame(frame, tracker, crosswalk_detector, clahe, prev_gray_roi)
+#       위 파이프라인 1~12단계를 수행. (결과 프레임, 추적 상태, ROI 그레이) 반환.
+#   - draw_dashed_line(img, pt1, pt2, ...)
+#       차로 중앙 유도 점선 그리기 유틸리티.
+#   - run_video_pipeline(...)
+#       비디오 읽기 -> process_frame -> 저장/미리보기 메인 루프, 진행률/FPS 출력.
+#
+#   [실행]
+#   - __main__ : argparse 옵션 (--input, --output, --start_frame,
+#                --max_frames, --no_preview) 처리 후 run_video_pipeline 호출.
+#
+# ■ 추적기 상태값(status)
+#   TRACKING / PARTIAL_LEFT / PARTIAL_RIGHT / RECOVER_LEFT / RECOVER_RIGHT /
+#   HOLD (n/35) / LOST / DETECTING / CROSSWALK_PAUSE
+# ==============================================================================
 
 import os
-import sys
 import time
 import argparse
 from collections import deque
@@ -53,7 +74,7 @@ class CrosswalkAndMotionDetector:
         self.stop_duration_frames = 0
         self.motion_history = deque(maxlen=15)
 
-    def update(self, current_gray_roi, prev_gray_roi, edge_roi, y_offset):
+    def update(self, current_gray_roi, prev_gray_roi, edge_roi):
         # 1. 횡단보도 엣지 교번 빈도 검출 (ROI 영역 내부에서 분석)
         roi_h = edge_roi.shape[0]
         scan_y1 = int(roi_h * 0.35)
@@ -63,7 +84,7 @@ class CrosswalkAndMotionDetector:
         for y_pos in [scan_y1, scan_y2]:
             row = edge_roi[y_pos, int(self.w * 0.28):int(self.w * 0.72)]
             transitions = np.count_nonzero(np.diff(row > 128))
-            if transitions >= 15:
+            if transitions >= 14:
                 zebra_score += 1
 
         self.is_crosswalk = (zebra_score >= 1)
@@ -341,8 +362,8 @@ def process_frame(frame, tracker, crosswalk_detector, clahe, prev_gray_roi=None)
     masked_canny_roi = cv2.bitwise_and(canny_roi, roi_mask)
 
     # 4. 횡단보도 감지 및 모션 분석 (표시 중단 / 재개 판별)
-    display_lanes, is_crosswalk, is_stopped = crosswalk_detector.update(
-        gray_roi, prev_gray_roi, masked_canny_roi, y_top
+    display_lanes, is_crosswalk, _ = crosswalk_detector.update(
+        gray_roi, prev_gray_roi, masked_canny_roi
     )
 
     # 5. 세로 모폴로지 팽창 (마모 차선 조각 결합)
@@ -450,7 +471,7 @@ def process_frame(frame, tracker, crosswalk_detector, clahe, prev_gray_roi=None)
         cx2, cy2 = int((lx2 + rx2) / 2), ly2
         draw_dashed_line(result, (cx1, cy1), (cx2, cy2), color=(255, 255, 220), thickness=3, dash_length=14)
 
-    return result, canny_roi, status, gray_roi
+    return result, status, gray_roi
 
 
 def draw_dashed_line(img, pt1, pt2, color=(255, 255, 255), thickness=2, dash_length=12):
@@ -491,7 +512,7 @@ def run_video_pipeline(
     crosswalk_detector = CrosswalkAndMotionDetector(proc_w, proc_h)
 
     # ROI 전용 CLAHE 객체 생성
-    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(3, 3))
+    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
 
     # 꼬임 방지 기능 탑재 차선 추적기
     tracker = ADASLaneTrackerV3(max_hold_frames=35, alpha=0.22, max_slope_delta=0.35)
@@ -534,7 +555,7 @@ def run_video_pipeline(
             resized = cv2.resize(frame, (proc_w, proc_h), interpolation=cv2.INTER_AREA)
 
             # 파이프라인 처리 (BEV 없이 직접 처리)
-            res_frame, canny_roi, status, cur_gray_roi = process_frame(
+            res_frame, status, cur_gray_roi = process_frame(
                 resized, tracker, crosswalk_detector, clahe, prev_gray_roi
             )
             prev_gray_roi = cur_gray_roi
