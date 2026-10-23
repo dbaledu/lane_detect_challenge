@@ -232,12 +232,11 @@ def crop_and_resize_roi(frame, roi_corners, bbox, target_size=(320, 360)):
 
 def preprocess_roi(roi_img):
     """
-    독립된 ROI 이미지에 Sobel-X 기반 전처리 적용:
+    독립된 ROI 이미지에 Canny 기반 전처리 적용:
     1. Grayscale 변환
-    2. 독립적 CLAHE (좌/우 조명 차이에 맞춤 적응)
+    2. 독립적 CLAHE (좌/우 조명 차이에 맞춰 적응)
     3. GaussianBlur (노이즈 완화)
-    4. Sobel-X 연산: 수직/대각선 차선 성분을 극대화하고 가로선(횡단보도/정지선) 억제
-    5. Sobel-X 기반 Canny 엣지 검출
+    4. Canny 엣지 검출
     """
     gray = cv2.cvtColor(roi_img, cv2.COLOR_BGR2GRAY)
 
@@ -248,14 +247,8 @@ def preprocess_roi(roi_img):
     # 고주파 노이즈 제거
     blurred = cv2.GaussianBlur(enhanced, (5, 5), 0)
 
-    # [핵심] Sobel-X 연산 적용 (가로 방향 그래디언트 추출 -> 수직 차선 성분 극대화)
-    sobelx = cv2.Sobel(blurred, cv2.CV_64F, 1, 0, ksize=3)
-    abs_sobelx = np.absolute(sobelx)
-    max_val = np.max(abs_sobelx)
-    scaled_sobel = np.uint8(255.0 * abs_sobelx / (max_val + 1e-5))
-
-    # Sobel-X 맵 기반 엣지 검출
-    edges = cv2.Canny(scaled_sobel, 40, 130)
+    # Canny 엣지 검출
+    edges = cv2.Canny(blurred, 50, 150)
     return edges
 
 
@@ -484,7 +477,7 @@ def main():
     show_bbox = True
     paused = False
 
-    print("=== Sobel-X + maxLineGap 60 + 횡단보도 동적 ROI 제어 차선 추적 파이프라인 ===")
+    print("=== Canny 엣지 + maxLineGap 60 + 횡단보도 동적 ROI 제어 차선 추적 파이프라인 ===")
     print("- 'q': 종료")
     print("- 'b': 축소된 Bounding Box 표시 토글")
     print("- 'd': 좌/우 독립 엣지 미니맵 디버그 뷰 토글")
@@ -552,8 +545,8 @@ def main():
                 combined_bgr = cv2.cvtColor(combined_edges, cv2.COLOR_GRAY2BGR)
 
                 cv2.line(combined_bgr, (320, 0), (320, 360), (0, 255, 255), 2)
-                cv2.putText(combined_bgr, "LEFT (Sobel-X)", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 200, 0), 2)
-                cv2.putText(combined_bgr, "RIGHT (Sobel-X)", (340, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
+                cv2.putText(combined_bgr, "LEFT (Canny)", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 200, 0), 2)
+                cv2.putText(combined_bgr, "RIGHT (Canny)", (340, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
 
                 mini_w, mini_h = 320, 180
                 mini_display = cv2.resize(combined_bgr, (mini_w, mini_h))
