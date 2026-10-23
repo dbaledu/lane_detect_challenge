@@ -26,8 +26,7 @@
 │   │   └── road_markings.py      # 횡단보도(지브라 패턴) 및 정지선(수평선) 탐지
 │   ├── 📁 state/
 │   │   ├── motion_estimator.py   # 특징점 광학 흐름(Optical Flow) 및 중앙값 필터링
-│   │   ├── state_classifier.py   # 시계열 상태 머신 (주행·감속 의심·정지 의심·출발 감지)
-│   │   └── decision_fusion.py    # 자차 상태 + 앞차 움직임 + 보행자 + 정지선 종합 판단
+│   │   └── decision_fusion.py    # 자차 움직임 + 앞차 움직임 + 보행자 + 정지선 종합 판단
 │   ├── 📁 output/
 │   │   ├── video_writer.py       # 주석 오버레이 비디오 인코딩 및 저장
 │   │   ├── csv_logger.py         # frame_log.csv, performance.csv 실시간 기록

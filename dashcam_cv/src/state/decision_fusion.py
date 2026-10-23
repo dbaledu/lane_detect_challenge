@@ -8,7 +8,6 @@ from ..common.data_models import (
     LaneResult,
     QualityMetric
 )
-from .state_classifier import StateClassifier
 
 
 class DecisionFusion:
@@ -17,7 +16,7 @@ class DecisionFusion:
     def __init__(self, cfg: Optional[Dict[str, Any]] = None):
         self.cfg = cfg or {}
         st_cfg = self.cfg.get("state", {})
-        self.state_classifier = StateClassifier(cfg)
+        self.stopped_th = float(st_cfg.get("flow_stopped_threshold", 0.85))
 
         # Anti-flickering debounce and hold-time parameters
         self.state_hold_frames = int(st_cfg.get("state_hold_frames", 12))  # ~0.4s hold
@@ -59,8 +58,19 @@ class DecisionFusion:
         else:
             self.crosswalk_persist = max(0, self.crosswalk_persist - 1)
 
-        # 2. Get Ego State from State Machine
-        ego_state, ego_reason, ego_conf = self.state_classifier.update(motion, quality)
+        # 2. Get Ego State directly from Motion and Quality
+        if not motion.is_reliable or quality.is_blurred:
+            ego_state = "UNCERTAIN"
+            ego_reason = "영상 흔들림 또는 특징점 소실로 모션 측정 신뢰도 낮음"
+            ego_conf = 0.30
+        elif motion.magnitude < self.stopped_th:
+            ego_state = "STOPPED_SUSPECTED"
+            ego_reason = f"배경 이동량({motion.magnitude:.2f}px) 미미하여 정지 판단"
+            ego_conf = 0.90
+        else:
+            ego_state = "NORMAL_DRIVING"
+            ego_reason = f"유의미한 배경 이동량({motion.magnitude:.2f}px) 유지"
+            ego_conf = 0.88
 
         # 3. Extract Lead Vehicle and Pedestrian Dynamics
         lead_obj: Optional[ObjectBox] = None
