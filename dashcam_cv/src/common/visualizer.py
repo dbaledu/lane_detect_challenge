@@ -57,11 +57,11 @@ class HUDVisualizer:
                 (lx1, ly1), (lx2, ly2), (rx2, ry2), (rx1, ry1)
             ]], dtype=np.int32)
 
-            # Corridor color changes depending on warning state
+            # Corridor color changes depending on warning decision state
             corridor_color = (0, 200, 0)  # Green
-            if "DECELERATION" in state.ego_state or state.fusion_state == "SLOW_DOWN":
+            if state.fusion_state == "SLOW_DOWN":
                 corridor_color = (0, 180, 240)  # Amber
-            elif "STOP" in state.ego_state or state.fusion_state == "STOP_REQUIRED":
+            elif state.fusion_state == "STOP_REQUIRED":
                 corridor_color = (40, 40, 220)  # Red
 
             cv2.fillPoly(overlay, corridor_pts, corridor_color)
@@ -134,7 +134,7 @@ class HUDVisualizer:
 
         # 5. Draw HUD Dashboard Card (Top Left)
         if self.show_hud_card:
-            card_w, card_h = 380, 195
+            card_w, card_h = 380, 172
             card_x, card_y = 15, 15
 
             # Translucent dark background
@@ -155,43 +155,28 @@ class HUDVisualizer:
             cv2.putText(vis, info_str, (card_x + 12, card_y + 46),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1, cv2.LINE_AA)
 
-            # Ego State Badge
-            state_color = (0, 200, 0)  # Green
-            if "DECELERATION" in state.ego_state:
-                state_color = (0, 165, 255)  # Orange
-            elif "STOPPED" in state.ego_state:
-                state_color = (50, 50, 255)  # Red
-            elif "START" in state.ego_state:
-                state_color = (255, 220, 0)  # Cyan
-            elif "UNCERTAIN" in state.ego_state:
-                state_color = (150, 150, 150)
-
-            ego_text = f"EGO: {state.ego_state}"
-            cv2.putText(vis, ego_text, (card_x + 12, card_y + 70),
-                        cv2.FONT_HERSHEY_DUPLEX, 0.52, state_color, 1, cv2.LINE_AA)
-
             # Lead Vehicle State
             lead_color = (255, 100, 100) if state.lead_state in ("STOPPED", "APPROACHING") else (180, 220, 180)
-            cv2.putText(vis, f"LEAD: {state.lead_state} | LC: {state.lane_change_status}", (card_x + 12, card_y + 92),
+            cv2.putText(vis, f"LEAD: {state.lead_state} | LC: {state.lane_change_status}", (card_x + 12, card_y + 70),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, lead_color, 1, cv2.LINE_AA)
 
-            # Fusion State & Reason
-            cv2.putText(vis, f"DECISION: {state.fusion_state}", (card_x + 12, card_y + 115),
+            # Fusion Decision State & Reason (주행 판단 및 사유 유지)
+            cv2.putText(vis, f"DECISION: {state.fusion_state}", (card_x + 12, card_y + 93),
                         cv2.FONT_HERSHEY_DUPLEX, 0.5, (0, 230, 255), 1, cv2.LINE_AA)
             reason_trunc = state.reason if len(state.reason) < 40 else state.reason[:38] + ".."
-            cv2.putText(vis, f"  -> {reason_trunc}", (card_x + 12, card_y + 135),
+            cv2.putText(vis, f"  -> {reason_trunc}", (card_x + 12, card_y + 113),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.40, (220, 220, 220), 1, cv2.LINE_AA)
 
             # Lane Status & Offset
             lane_str = f"LANE: {lane.status} (conf:{lane.lane_confidence:.2f})"
             err_str = f"Δx:{int(lane.lane_error_px):+d}px" if lane.lane_error_px is not None else "Δx:N/A"
-            cv2.putText(vis, f"{lane_str} | {err_str}", (card_x + 12, card_y + 158),
+            cv2.putText(vis, f"{lane_str} | {err_str}", (card_x + 12, card_y + 136),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 240, 180), 1, cv2.LINE_AA)
 
             # Motion & Lighting
             night_tag = "NIGHT" if quality.is_night else "DAY"
             cv2.putText(vis, f"FLOW: {motion.magnitude:.2f} px/f | LIGHT: {night_tag} (br:{quality.brightness:.0f})",
-                        (card_x + 12, card_y + 180),
+                        (card_x + 12, card_y + 156),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.40, (190, 190, 190), 1, cv2.LINE_AA)
 
         # 6. Draw Debug Minimap (Top Right)
