@@ -116,6 +116,25 @@ class MotionResult:
 
 
 @dataclass
+class TrafficLightResult:
+    """Traffic light detection result based on color thresholding and circular light shape."""
+    detected: bool = False
+    color: Optional[str] = None  # "RED", "YELLOW", "GREEN", None
+    bbox: Optional[Tuple[int, int, int, int]] = None  # (x1, y1, x2, y2)
+    circle: Optional[Tuple[int, int, int]] = None  # (cx, cy, radius)
+    confidence: float = 0.0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "detected": self.detected,
+            "color": self.color,
+            "bbox": list(self.bbox) if self.bbox is not None else None,
+            "circle": list(self.circle) if self.circle is not None else None,
+            "confidence": round(self.confidence, 2),
+        }
+
+
+@dataclass
 class DrivingStateResult:
     """Ego vehicle and lead vehicle combined state determination."""
     ego_state: str = "UNCERTAIN"       # NORMAL_DRIVING, DECELERATION_SUSPECTED, STOPPED_SUSPECTED, START_DETECTED, UNCERTAIN
@@ -124,6 +143,7 @@ class DrivingStateResult:
     reason: str = "Initializing"
     confidence: float = 0.5
     lane_change_status: str = "KEEPING" # KEEPING, CANDIDATE, IN_PROGRESS, COMPLETE
+    traffic_light: TrafficLightResult = field(default_factory=TrafficLightResult)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -133,6 +153,7 @@ class DrivingStateResult:
             "reason": self.reason,
             "confidence": round(self.confidence, 2),
             "lane_change_status": self.lane_change_status,
+            "traffic_light": self.traffic_light.to_dict(),
         }
 
 

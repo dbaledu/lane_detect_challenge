@@ -132,6 +132,28 @@ class HUDVisualizer:
             cv2.putText(vis, tag, (x1 + 3, max(th, y1 - 3)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1, cv2.LINE_AA)
 
+        # 4.1 Draw Detected Traffic Light
+        if state.traffic_light and state.traffic_light.detected:
+            tl = state.traffic_light
+            color_map = {
+                "RED": (0, 0, 255),
+                "YELLOW": (0, 220, 255),
+                "GREEN": (0, 255, 0)
+            }
+            tl_box_color = color_map.get(tl.color, (0, 220, 255))
+            if tl.bbox:
+                tx1, ty1, tx2, ty2 = tl.bbox
+                cv2.rectangle(vis, (tx1, ty1), (tx2, ty2), tl_box_color, 2)
+                tl_tag = f"TL: {tl.color} ({tl.confidence:.2f})"
+                (tw, th), _ = cv2.getTextSize(tl_tag, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+                cv2.rectangle(vis, (tx1, max(0, ty1 - th - 6)), (tx1 + tw + 6, max(th + 6, ty1)), tl_box_color, -1)
+                cv2.putText(vis, tl_tag, (tx1 + 3, max(th, ty1 - 3)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1, cv2.LINE_AA)
+            if tl.circle:
+                tcx, tcy, tr = tl.circle
+                cv2.circle(vis, (tcx, tcy), tr, (255, 255, 255), 1, cv2.LINE_AA)
+                cv2.circle(vis, (tcx, tcy), max(2, tr - 2), tl_box_color, -1)
+
         # 5. Draw HUD Dashboard Card (Top Left)
         if self.show_hud_card:
             card_w, card_h = 380, 172
@@ -155,9 +177,10 @@ class HUDVisualizer:
             cv2.putText(vis, info_str, (card_x + 12, card_y + 46),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1, cv2.LINE_AA)
 
-            # Lead Vehicle State
+            # Lead Vehicle State & Traffic Light
             lead_color = (255, 100, 100) if state.lead_state in ("STOPPED", "APPROACHING") else (180, 220, 180)
-            cv2.putText(vis, f"LEAD: {state.lead_state} | LC: {state.lane_change_status}", (card_x + 12, card_y + 70),
+            tl_tag_hud = f" | TL:{state.traffic_light.color}" if (state.traffic_light and state.traffic_light.detected and state.traffic_light.color) else ""
+            cv2.putText(vis, f"LEAD: {state.lead_state} | LC: {state.lane_change_status}{tl_tag_hud}", (card_x + 12, card_y + 70),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, lead_color, 1, cv2.LINE_AA)
 
             # Fusion Decision State & Reason (주행 판단 및 사유 유지)
