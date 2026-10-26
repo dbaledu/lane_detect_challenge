@@ -130,6 +130,73 @@ def preprocess_roi(roi_img: np.ndarray) -> np.ndarray:
     return edges
 
 
+# ── lane detect.py 파이프라인 함수들 ─────────────────────────────────────────
+
+def make_roi_mask(h: int, w: int) -> Tuple[np.ndarray, np.ndarray]:
+    """단일 사다리꼴 ROI 마스크 사전 계산 (lane detect.py 파이프라인용).
+
+    ROI 좌표 비율:
+    - 상단: y=0.65h, x=0.44w ~ 0.56w
+    - 하단: y=0.88h, x=0.18w ~ 0.82w
+    """
+    pts = np.array([[
+        (int(w * 0.44), int(h * 0.65)),
+        (int(w * 0.56), int(h * 0.65)),
+        (int(w * 0.82), int(h * 0.88)),
+        (int(w * 0.18), int(h * 0.88)),
+    ]], dtype=np.int32)
+    mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.fillPoly(mask, pts, 255)
+    return mask, pts
+
+
+def extract_fits(
+    lines: Optional[np.ndarray],
+    h: int,
+    w: int
+) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    """허프 선분에서 좌/우 차선 1차 피팅 계수 추출 (lane detect.py 파이프라인용).
+
+    - 기울기 조건: 0.45 <= |slope| <= 3.0
+    - 좌측: slope < 0, 우측 경계 < cx + w*0.05
+    - 우측: slope > 0, 좌측 경계 > cx - w*0.05
+    - 반환값: polyfit(y, x, 1) → [m, c] (x = m*y + c)
+    """
+    if lines is None:
+        return None, None
+    cx = w * 0.5
+    lx, ly, rx, ry = [], [], [], []
+    for x1, y1, x2, y2 in lines.reshape(-1, 4):
+        if x1 == x2:
+            continue
+        slope = (y2 - y1) / (x2 - x1)
+        if abs(slope) < 0.45 or abs(slope) > 3.0:
+            continue
+        if slope < 0 and max(x1, x2) < cx + w * 0.05:
+            lx += [x1, x2]; ly += [y1, y2]
+        elif slope > 0 and min(x1, x2) > cx - w * 0.05:
+            rx += [x1, x2]; ry += [y1, y2]
+    lfit = np.polyfit(ly, lx, 1) if len(lx) >= 4 else None
+    rfit = np.polyfit(ry, rx, 1) if len(rx) >= 4 else None
+    return lfit, rfit
+
+
+def scale_fit(
+    fit: Optional[np.ndarray],
+    scale: float
+) -> Optional[np.ndarray]:
+    """polyfit 계수를 다른 해상도로 변환 (intercept만 스케일 적용).
+
+    다운스케일(PROCESS_SCALE) 해상도에서 피팅된 계수를
+    원본 해상도로 복원할 때 사용.
+    - slope(m): 비율이므로 변환 불필요
+    - intercept(c): c_orig = c_scaled / scale
+    """
+    if fit is None:
+        return None
+    return np.array([fit[0], fit[1] / scale], dtype=np.float32)
+
+
 def detect_crosswalk(
     frame: np.ndarray,
     top_ratio: float = 0.65,
@@ -253,6 +320,18 @@ class LaneDetector:
 
         self.target_size = tuple(lane_cfg.get("roi_target_size", (320, 360)))
 
+        # lane detect.py 파이프라인 파라미터
+        self.process_scale = float(lane_cfg.get("process_scale", 0.4))
+        self._roi_mask_cache: Dict[Tuple[int, int], Tuple[np.ndarray, np.ndarray]] = {}
+        self._clahe_simple = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+
+    def _get_roi_mask(self, h: int, w: int) -> Tuple[np.ndarray, np.ndarray]:
+        """처리 해상도(sh, sw)에 맞는 ROI 마스크를 캐싱하여 반환."""
+        key = (h, w)
+        if key not in self._roi_mask_cache:
+            self._roi_mask_cache[key] = make_roi_mask(h, w)
+        return self._roi_mask_cache[key]
+
     def detect_crosswalk(self, frame: np.ndarray) -> Tuple[bool, List[Tuple[int, int, int, int]]]:
         """주행 영역 내 횡단보도 패턴 감지."""
         return detect_crosswalk(frame, top_ratio=0.65, bot_ratio=0.88)
@@ -372,6 +451,74 @@ class LaneDetector:
         }
 
         return curr_left_fit, curr_right_fit, is_crosswalk, debug_info
+
+    def detect_scaled(
+        self,
+        frame: np.ndarray,
+        process_scale: Optional[float] = None
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], np.ndarray]:
+        """lane detect.py 파이프라인 기반 경량 차선 검출.
+
+        기존 detect()의 듀얼 ROI / 원본 해상도 처리와 달리,
+        단일 사다리꼴 ROI + PROCESS_SCALE 다운스케일 + π/90 허프 변환으로
+        실시간 성능을 최적화한 파이프라인.
+
+        처리 과정:
+            1. INTER_NEAREST 로 PROCESS_SCALE 배율 다운스케일
+            2. 그레이스케일 변환
+            3. CLAHE (clipLimit=2.0) + 3×3 GaussianBlur + Canny (60, 150)
+            4. 사전 계산된 단일 ROI 마스크 적용
+            5. HoughLinesP (θ=π/90, threshold=25, minLen=18, maxGap=22)
+            6. extract_fits() → 기울기 기반 좌/우 분리 피팅
+            7. scale_fit() → 원본 해상도 좌표로 복원
+
+        Args:
+            frame: 원본 BGR 프레임 (임의 해상도 가능)
+            process_scale: 다운스케일 배율 (None이면 self.process_scale 사용)
+
+        Returns:
+            left_fit:  좌측 차선 [m, c] 원본 해상도 기준, 없으면 None
+            right_fit: 우측 차선 [m, c] 원본 해상도 기준, 없으면 None
+            roi_edges: 처리 해상도의 ROI 적용 에지 맵 (디버그용)
+        """
+        scale = process_scale if process_scale is not None else self.process_scale
+        orig_h, orig_w = frame.shape[:2]
+        sw = int(orig_w * scale)
+        sh = int(orig_h * scale)
+
+        # [STEP 1] 다운스케일 (INTER_NEAREST → 빠른 축소)
+        small = cv2.resize(frame, (sw, sh), interpolation=cv2.INTER_NEAREST)
+
+        # [STEP 2] 그레이스케일
+        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+
+        # [STEP 3] CLAHE (clipLimit=2.0) + 3×3 Blur + Canny (60, 150)
+        enhanced = self._clahe_simple.apply(gray)
+        blurred = cv2.GaussianBlur(enhanced, (3, 3), 0)
+        edges = cv2.Canny(blurred, 60, 150)
+
+        # [STEP 4] 사전 계산된 단일 ROI 마스크 적용
+        roi_mask, _ = self._get_roi_mask(sh, sw)
+        roi_edges = cv2.bitwise_and(edges, roi_mask)
+
+        # [STEP 5] 허프 변환 (θ=π/90 → 탐색 각도 절반으로 속도 향상)
+        lines = cv2.HoughLinesP(
+            roi_edges,
+            rho=1,
+            theta=np.pi / 90,
+            threshold=25,
+            minLineLength=18,
+            maxLineGap=22
+        )
+
+        # [STEP 6] 기울기 기반 좌/우 분리 피팅
+        cur_l, cur_r = extract_fits(lines, sh, sw)
+
+        # [STEP 7] 원본 해상도로 intercept 복원
+        left_fit = scale_fit(cur_l, scale)
+        right_fit = scale_fit(cur_r, scale)
+
+        return left_fit, right_fit, roi_edges
 
     # ── 기존 단위 테스트 호환용 메서드 ──────────────────────────────────────────
     def detect_lines(self, edges: np.ndarray, roi_corners: np.ndarray) -> Tuple[Optional[np.ndarray], np.ndarray]:
