@@ -22,11 +22,7 @@ from src.video.quality_analyzer import QualityAnalyzer
 from src.lane.lane_detector import LaneDetector
 from src.lane.lane_tracker import LaneTracker
 from src.lane.lane_change import LaneChangeDetector
-from src.lane.lanes_detector_v1_EM import (
-    ADASLaneTrackerV3,
-    CrosswalkAndMotionDetector,
-    process_frame as expert_process_frame,
-)
+
 from src.objects.detector import ObjectDetector
 from src.objects.object_tracker import ObjectTracker
 from src.objects.road_markings import RoadMarkingDetector
@@ -118,14 +114,6 @@ def run_pipeline(cfg: dict, args: argparse.Namespace):
     lane_detector = LaneDetector(cfg)
     lane_tracker = LaneTracker(cfg)
     lane_change_detector = LaneChangeDetector(cfg)
-
-    # detect_lanes_v4_expert 전용 상태 객체
-    expert_tracker = ADASLaneTrackerV3()
-    expert_crosswalk_detector = CrosswalkAndMotionDetector(
-        w=meta.target_width, h=meta.target_height
-    )
-    expert_clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
-    expert_prev_gray_roi = None
     object_detector = ObjectDetector(cfg)
     object_tracker = ObjectTracker(cfg)
     road_markings = RoadMarkingDetector(cfg)
@@ -166,20 +154,17 @@ def run_pipeline(cfg: dict, args: argparse.Namespace):
             quality = quality_analyzer.analyze(frame, gray)
             t_preprocess = (time.perf_counter() - t0) * 1000.0
 
-            # Lane Detection & Tracking (detect_lanes_v4_expert)
+            # Lane Detection & Tracking (cv1021.py dual-ROI Canny + Kalman Filter)
             t0 = time.perf_counter()
-            frame, roi_edges, expert_status, expert_gray_roi = expert_process_frame(
-                frame,
-                expert_tracker,
-                expert_crosswalk_detector,
-                expert_clahe,
-                prev_gray_roi=expert_prev_gray_roi,
-            )
-            expert_prev_gray_roi = expert_gray_roi
-            # 기존 파이프라인 호환을 위해 레거시 변수 유지
-            lines, raw_left, raw_right, raw_conf = None, None, None, 0.0
+            curr_left_fit, curr_right_fit, is_crosswalk, lane_debug = lane_detector.detect(frame)
             lane_res = lane_tracker.update(
-                raw_left, raw_right, raw_conf, meta.target_width, meta.target_height
+                curr_left_fit=curr_left_fit,
+                curr_right_fit=curr_right_fit,
+                raw_confidence=lane_debug.get("confidence", 0.0),
+                w=meta.target_width,
+                h=meta.target_height,
+                is_crosswalk=is_crosswalk,
+                debug_info=lane_debug,
             )
             lane_change_st = lane_change_detector.update(lane_res)
             t_lane = (time.perf_counter() - t0) * 1000.0
@@ -187,6 +172,10 @@ def run_pipeline(cfg: dict, args: argparse.Namespace):
             # Road Markings (Crosswalks and Stop lines)
             t0 = time.perf_counter()
             markings_res = road_markings.detect(frame, enhanced, edges)
+            if is_crosswalk:
+                markings_res.crosswalk_detected = True
+                if lane_debug.get("cw_boxes") and not markings_res.crosswalk_boxes:
+                    markings_res.crosswalk_boxes = lane_debug.get("cw_boxes", [])
             t_markings = (time.perf_counter() - t0) * 1000.0
 
             # Object Detection
@@ -231,10 +220,11 @@ def run_pipeline(cfg: dict, args: argparse.Namespace):
             dummy_timings.total_ms = (t_preprocess + t_lane + t_detect + t_tracking +
                                      t_markings + t_motion + t_decision)
 
+            debug_map = lane_debug.get("combined_edges") if visualizer.show_debug_minimap else None
             vis_frame = visualizer.draw(
                 frame, frame_idx, timestamp, lane_res, tracked_objects,
                 markings_res, motion_res, state_res, dummy_timings, quality,
-                debug_edge_map=roi_edges
+                debug_edge_map=debug_map
             )
             t_render = (time.perf_counter() - t0) * 1000.0
 
@@ -279,6 +269,9 @@ def run_pipeline(cfg: dict, args: argparse.Namespace):
                     paused = not paused
                 elif key == ord('d'):
                     visualizer.show_debug_minimap = not visualizer.show_debug_minimap
+                elif key == ord('b'):
+                    visualizer.show_bbox = not visualizer.show_bbox
+
 
     finally:
         reader.release()

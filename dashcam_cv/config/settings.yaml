@@ -29,26 +29,28 @@ preprocessing:
   canny_high: 150
   morph_close: true                  # 점선 연결을 위한 닫힘 연산
 
-# 4. 관심 영역 (ROI) 설정 - 블랙박스 왜곡 및 OSD 배제 최적화
+# 4. 관심 영역 (ROI) 설정 - cv1021.py 듀얼 ROI 및 컴팩트 Bounding Box
 roi:
-  top_ratio: 0.65           # 상단 높이 (앞차 번호판/보행자 상체 배제)
-  bottom_ratio: 0.88        # 하단 높이 (차량 보닛 및 OSD 텍스트 배제)
-  top_left_ratio: 0.44      # 상단 좌측 x 비율
-  top_right_ratio: 0.56     # 상단 우측 x 비율
-  bottom_left_ratio: 0.18   # 하단 좌측 x 비율 (인도 왜곡 배제)
-  bottom_right_ratio: 0.82  # 하단 우측 x 비율
+  top_ratio: 0.67           # 상단 높이 (y=0.67h)
+  bottom_ratio: 0.86        # 하단 높이 (y=0.86h)
+  bbox_scale_x: 0.72        # BBox 가로폭 28% 압축 비율
+  top_left_ratio: 0.40      # 상단 좌측 x 비율
+  top_right_ratio: 0.60     # 상단 우측 x 비율
+  bottom_left_ratio: 0.28   # 하단 좌측 x 비율
+  bottom_right_ratio: 0.72  # 하단 우측 x 비율
 
-# 5. 차선 검출 및 추적 설정
+# 5. 차선 검출 및 추적 설정 (cv1021.py Canny + 허프 maxLineGap 60 + 4D Kalman Filter)
 lane:
-  hough_threshold: 35       # 허프 변환 임계값
-  min_line_length: 25       # 최소 선분 길이
-  max_line_gap: 35          # 끊어진 선분 연결 최대 간격
-  min_slope: 0.45           # 횡단보도 가로선 제거용 최소 기울기
-  max_slope: 3.0            # 수직 가드레일/노이즈 제거용 최대 기울기
-  smoothing_alpha: 0.20     # 지수이동평균(EMA) 가중치 (0~1)
-  max_lost_frames: 30       # 차선 미검출 시 직전 차선 예측 유지 최대 프레임수 (~1초)
+  hough_threshold: 25       # 허프 변환 임계값 (cv1021.py)
+  min_line_length: 20       # 최소 선분 길이 (cv1021.py)
+  max_line_gap: 60          # 끊어진 선분 연결 최대 간격 (cv1021.py)
+  min_slope: 0.40           # 횡단보도 가로선 제거용 최소 기울기 (|기울기| < 0.40 제외)
+  max_slope: 3.0            # 수직 노이즈 제거용 최대 기울기 (|기울기| > 3.0 제외)
+  max_lost_frames: 30       # 차선 미검출 시 칼만 예측 유지 최대 프레임수 (30프레임)
   default_lane_width_ratio: 0.45  # 편측 검출 시 반대편 차선 추정용 기본 차로폭 비율
   min_confidence: 0.25      # 최소 유효 신뢰도
+  roi_target_size: [320, 360]     # 독립 ROI 리사이즈 해상도
+
 
 # 6. 차선 변경 감지 설정
 lane_change:
@@ -108,3 +110,5 @@ visualization:
   show_center_path: true    # 주행 중심 경로선 표시
   show_hud_card: true       # 주행 상태 및 지표 대시보드 표시
   show_debug_minimap: true  # 우측 상단 ROI 에지 미니맵 표시
+  show_objects: true        # 객체 검출 바운딩 박스 표시 여부
+  show_object_labels: true  # 객체 검출 바운딩 박스 라벨(태그 텍스트) 표시 여부

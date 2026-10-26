@@ -85,7 +85,7 @@
 
 ## 3. 설치 및 실행 방법
 
-### 1) 환경 준비
+### 1. 환경 준비
 ```bash
 # 가상환경 생성 (권장)
 python -m venv .venv
@@ -96,7 +96,7 @@ pip install -r requirements.txt
 ```
 *(선택사항) GPU 또는 최신 YOLO 가중치를 활용하려면 `pip install ultralytics`를 설치하면 자동으로 YOLO 백엔드가 활성화됩니다.*
 
-### 2) 파이프라인 실행
+### 2 파이프라인 실행
 ```bash
 # 기본 설정으로 실행 (Test_Video_2.mp4 대상)
 python src/main.py
@@ -111,7 +111,7 @@ python src/main.py --display
 python src/main.py --max-frames 100 --no-display
 ```
 
-### 3) 단위 테스트 실행
+### 3. 단위 테스트 실행
 ```bash
 python -m unittest discover -s tests
 ```
@@ -136,7 +136,6 @@ python -m unittest discover -s tests
    - 유효 차선 검출률 및 객체 감지 통계
    - 주행 상태별 구간 지속 시간 및 백분율 통계
 
----
 
 ## 5. 경량화 비교 실험 가이드 (계획서 제8절)
 

@@ -38,6 +38,15 @@ class LaneResult:
     lost_frames: int = 0
     is_uncertain: bool = True
     lane_width_px: Optional[float] = None
+    left_corners: Optional[Any] = None
+    right_corners: Optional[Any] = None
+    left_bbox: Optional[Tuple[int, int, int, int]] = None
+    right_bbox: Optional[Tuple[int, int, int, int]] = None
+    is_crosswalk: bool = False
+
+    def __iter__(self):
+        """Allows unpacking as (left_fit, right_fit, lost_frames) for cv1021.py compatibility."""
+        return iter((self.left_fit, self.right_fit, self.lost_frames))
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -47,7 +56,9 @@ class LaneResult:
             "lane_error_px": round(self.lane_error_px, 1) if self.lane_error_px is not None else None,
             "lost_frames": self.lost_frames,
             "is_uncertain": self.is_uncertain,
+            "is_crosswalk": self.is_crosswalk,
         }
+
 
 
 @dataclass

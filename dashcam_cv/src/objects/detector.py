@@ -7,7 +7,7 @@ from typing import List, Tuple, Dict, Any, Optional
 
 try:
     import torch
-except ImportError:
+except (ImportError, OSError, Exception):
     torch = None
 
 from ..common.data_models import ObjectBox
