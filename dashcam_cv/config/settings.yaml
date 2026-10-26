@@ -93,6 +93,15 @@ state:
   # 깜빡임(Flickering) 방지 및 안정화 설정
   state_hold_frames: 12     # 경고/감속/정지 상태 전환 시 최소 유지 프레임수 (~0.4초)
   state_debounce_frames: 2  # 일시적 노이즈 차단을 위한 전환 확정 필요 연속 프레임수
+  # 신호등 불빛 감지 (Traffic Light) 설정
+  traffic_light:
+    roi_top: 0.10             # 상위 10%부터 (상단 배제)
+    roi_bottom: 0.50          # 상위 50%까지 (하단 차량 후미등 배제)
+    roi_left: 0.15            # 좌측 15%부터 (도로변 좌측 상가 간판 배제)
+    roi_right: 0.85           # 우측 85%까지 (도로변 우측 전광판/가로등 배제)
+    min_saturation: 120       # 최소 채도 (전광판 백색광 배제)
+    min_value: 180            # 최소 밝기 (어두운 노이즈/가로등 배제)
+    debounce_frames: 2        # 안정화를 위한 연속 감지 프레임수
 
 # 11. 시각화 (HUD) 설정
 visualization:
