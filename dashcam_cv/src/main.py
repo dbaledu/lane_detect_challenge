@@ -198,7 +198,7 @@ def run_pipeline(cfg: dict, args: argparse.Namespace):
             # Decision Fusion
             t0 = time.perf_counter()
             state_res = decision_fusion.evaluate(
-                motion_res, quality, lane_res, tracked_objects, markings_res, lane_change_st, frame.shape
+                motion_res, quality, lane_res, tracked_objects, markings_res, lane_change_st, frame.shape, frame=frame
             )
             t_decision = (time.perf_counter() - t0) * 1000.0
 
