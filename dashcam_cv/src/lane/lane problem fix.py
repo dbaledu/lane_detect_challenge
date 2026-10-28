@@ -1,21 +1,3 @@
-"""Lane detection module based on cv1021.py dual-ROI, Canny edge detection, and Hough transform.
-
-Refactored to resolve:
-1. ROI truncation caused by shrink_bounding_box
-2. Crosswalk edge masking and parameter flow
-3. Weighted Least Squares fitting, outlier filtering, and y-span validation
-4. Continuous measurement quality-based confidence estimation
-5. Left-Right cross validation (no crossing, width bounds, slope consistency)
-6. Unified slope thresholds with no dead conditions
-7. Crosswalk hysteresis debouncing and false-positive prevention
-8. Configurable crosswalk and ROI coordinates
-9. Aspect-ratio aware scaling and normalized parameters
-10. Preallocated CLAHE objects to eliminate allocation overhead
-11. Safe line array validation and robust exception handling
-12. Single-ROI processing helper eliminating left/right code duplication
-13. Kalman-free lightweight temporal smoothing (EMA tracker) and hold state
-14. Real-time video processing runner for Test_Video_2.mp4 with HUD telemetry and PiP edge overlay
-"""
 import os
 import sys
 import time
@@ -967,7 +949,7 @@ def run_video_pipeline(
             if show_window:
                 try:
                     cv2.imshow("Lane Detection - Test_Video_2", annotated)
-                    key = cv2.waitKey(int(1000 / fps_in) if not paused else 30) & 0xFF
+                    key = cv2.waitKey(1) if not paused else 30 & 0xFF
                     if key == ord('q'):
                         print("\n[*] 사용자에 의해 재생 중단 (Quit).")
                         break
@@ -1035,7 +1017,7 @@ if __name__ == "__main__":
             video_to_run,
             "Test_Video_2.mp4",
             "Test_Video_2_05bb47dc.mp4",
-            "/public/assets/aistudio/Test_Video_2_05bb47dc.mp4",
+            "dashcam_cv/data/Test_Video_2.mp4",
             "public/assets/aistudio/Test_Video_2_05bb47dc.mp4",
         ]
         found = False
