@@ -123,7 +123,7 @@ class CheckerboardCalibrator:
         detected_count = 0
         img_shape = None
 
-        print(f"\\n[체커보드 캘리브레이션 시작] 패턴: {cols}x{rows} 코너 | 격자: {self.square_size}mm | 대상 이미지: {len(image_files)}장")
+        print(f"\n[체커보드 캘리브레이션 시작] 패턴: {cols}x{rows} 코너 | 격자: {self.square_size}mm | 대상 이미지: {len(image_files)}장")
 
         for idx, fname in enumerate(image_files):
             img = cv2.imread(fname)
@@ -161,8 +161,8 @@ class CheckerboardCalibrator:
             print(f"[오류] 캘리브레이션을 위해서는 최소 3장 이상의 유효한 체커보드 이미지가 필요합니다. (검출: {detected_count}장)")
             return False, detected_count, None
 
-        print(f"\\n[최적화 연산] {detected_count}장의 이미지 데이터로 cv2.calibrateCamera 수행 중...")
-        ret, mtx, dist, rvecs, tvecs = cv2.calibrateCamera(
+        print(f"\n[최적화 연산] {detected_count}장의 이미지 데이터로 cv2.calibrateCamera 수행 중...")
+        _, mtx, dist, rvecs, tvecs = cv2.calibrateCamera(
             objpoints, imgpoints, img_shape, None, None
         )
 
@@ -351,7 +351,7 @@ class CrosswalkAndMotionDetector:
                 self.display_lanes = True
                 self.stop_duration_frames = 0
 
-        return self.display_lanes, self.is_crosswalk, self.is_stopped
+        return self.display_lanes, self.is_crosswalk
 
 
 class ADASLaneTrackerV3:
@@ -361,10 +361,9 @@ class ADASLaneTrackerV3:
     - 양측 차선 안정적 검출 시 EMA 스무딩 및 동적 차로 폭 학습
     - 편측 차선 검출 또는 일시적 가림 시 이전 차선 상태 유지(Hold) 및 안전 복구
     """
-    def __init__(self, max_hold_frames=35, alpha=0.22, max_slope_delta=0.35):
+    def __init__(self, max_hold_frames=35, alpha=0.22):
         self.max_hold_frames = max_hold_frames
         self.alpha = alpha
-        self.max_slope_delta = max_slope_delta
 
         self.left_line = None
         self.right_line = None
@@ -383,15 +382,6 @@ class ADASLaneTrackerV3:
         if x2 == x1:
             return None
         return (y2 - y1) / (x2 - x1)
-
-    def _is_slope_consistent(self, new_line, ref_line):
-        if ref_line is None:
-            return True
-        ns = self._get_slope(new_line)
-        rs = self._get_slope(ref_line.astype(int).tolist())
-        if ns is None or rs is None:
-            return True
-        return abs(ns - rs) <= self.max_slope_delta
 
     def _is_valid_geometry(self, left, right, y_top):
         """
@@ -433,7 +423,7 @@ class ADASLaneTrackerV3:
 
         return True
 
-    def update(self, det_left, det_right, y_top, y_bottom, is_paused=False):
+    def update(self, det_left, det_right, y_top, is_paused=False):
         if is_paused:
             self.status = "CROSSWALK_PAUSE"
             return self._export()
@@ -547,7 +537,6 @@ def process_frame(frame, tracker, crosswalk_detector, clahe, prev_gray_roi=None,
     - [수정점 3] 모든 HUD 삭제 & 고시인성 네온 차로 & ROI-CLAHE
     """
     # 0. 체커보드 캘리브레이션 기반 광각 렌즈 왜곡 보정 (Undistortion)
-    # 왜곡으로 휘어진 차선을 실제 물리적 직선으로 복원하여 검출 및 칼만 추적 정확도 극대화
     if calibrator is not None and getattr(calibrator, "is_calibrated", False):
         frame = calibrator.undistort(frame)
 
@@ -588,8 +577,8 @@ def process_frame(frame, tracker, crosswalk_detector, clahe, prev_gray_roi=None,
     masked_canny_roi = cv2.bitwise_and(canny_roi, roi_mask)
 
     # 4. 횡단보도 감지 및 모션 분석 (표시 중단 / 재개 판별)
-    display_lanes, is_crosswalk, is_stopped = crosswalk_detector.update(
-        gray_roi, prev_gray_roi, masked_canny_roi, y_top
+    display_lanes, is_crosswalk = crosswalk_detector.update(
+        gray_roi, prev_gray_roi, masked_canny_roi
     )
 
     # 5. 세로 모폴로지 팽창 (마모 차선 조각 결합)
@@ -634,12 +623,10 @@ def process_frame(frame, tracker, crosswalk_detector, clahe, prev_gray_roi=None,
             x_bot_pred = (y_bottom - intercept) / slope
 
             # [수정점 2: 좌/우 분류 시 교차 및 꼬임 원천 방지]
-            # 좌측 차선: 음수 기울기, 하단은 화면 좌측, 상단 예측점은 중앙 좌측
             if slope < -0.42 and x_bot_pred < mid_x and x1 < mid_x + 20:
                 if int(w * 0.34) <= x_top_pred <= mid_x - 8:
                     left_candidates.append((slope, intercept, length))
 
-            # 우측 차선: 양수 기울기, 하단은 화면 우측, 상단 예측점은 중앙 우측
             elif slope > 0.42 and x_bot_pred > mid_x and x1 > mid_x - 20:
                 if mid_x + 8 <= x_top_pred <= int(w * 0.66):
                     right_candidates.append((slope, intercept, length))
@@ -648,11 +635,10 @@ def process_frame(frame, tracker, crosswalk_detector, clahe, prev_gray_roi=None,
     raw_left = fit_representative_line(left_candidates, y_bottom, y_top)
     raw_right = fit_representative_line(right_candidates, y_bottom, y_top)
 
-    # 9. 시계열 칼만 추적기 갱신 (차선 미검출 시 Predict 보완 및 꼬임 검증)
+    # 9. 시계열 추적기 갱신 (꼬임 방지 유효성 검증)
     smooth_left, smooth_right, status = tracker.update(
         raw_left, raw_right,
         y_top=y_top,
-        y_bottom=y_bottom,
         is_paused=(not display_lanes)
     )
 
@@ -664,14 +650,12 @@ def process_frame(frame, tracker, crosswalk_detector, clahe, prev_gray_roi=None,
         rx1, ry1, rx2, ry2 = smooth_right
 
         # [수정점 2 핵심: 렌더링 직전 꼬임 방지 안전 마진 강제 적용 (Anti-Twisting Guard)]
-        # 상단이 교차(rx2 <= lx2)하거나 너무 좁아지지 않도록 최소 26px 간격 강제 보장
         min_gap_top = 26
         if rx2 - lx2 < min_gap_top:
             center_top = (lx2 + rx2) / 2
             lx2 = int(center_top - min_gap_top / 2)
             rx2 = int(center_top + min_gap_top / 2)
 
-        # 하단이 교차하거나 너무 좁아지지 않도록 최소 160px 간격 강제 보장
         min_gap_bottom = 160
         if rx1 - lx1 < min_gap_bottom:
             center_bot = (lx1 + rx1) / 2
@@ -682,7 +666,7 @@ def process_frame(frame, tracker, crosswalk_detector, clahe, prev_gray_roi=None,
 
         # (1) 고시인성 네온 에메랄드 주행 차로 폴리곤
         lane_poly = np.array([[lx1, ly1], [lx2, ly2], [rx2, ry2], [rx1, ry1]], np.int32)
-        cv2.fillPoly(overlay, [lane_poly], (50, 255, 120))  # 선명한 형광 에메랄드
+        cv2.fillPoly(overlay, [lane_poly], (50, 255, 120))
         result = cv2.addWeighted(overlay, 0.45, frame, 0.55, 0)
 
         # (2) 좌측 차선: 일렉트릭 시안(8px 외곽선) + 화이트 코어(3px 발광)
@@ -698,7 +682,7 @@ def process_frame(frame, tracker, crosswalk_detector, clahe, prev_gray_roi=None,
         cx2, cy2 = int((lx2 + rx2) / 2), ly2
         draw_dashed_line(result, (cx1, cy1), (cx2, cy2), color=(255, 255, 220), thickness=3, dash_length=14)
 
-    return result, canny_roi, status, gray_roi
+    return result, status, gray_roi
 
 
 def draw_dashed_line(img, pt1, pt2, color=(255, 255, 255), thickness=2, dash_length=12):
@@ -765,7 +749,7 @@ def run_video_pipeline(
     clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
 
     # 4. 시계열 지수이동평균(EMA) 및 꼬임 방지 기능 탑재 차선 추적기
-    tracker = ADASLaneTrackerV3(max_hold_frames=35, alpha=0.22, max_slope_delta=0.35)
+    tracker = ADASLaneTrackerV3(max_hold_frames=35, alpha=0.22)
 
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
@@ -775,14 +759,13 @@ def run_video_pipeline(
     frames_to_process = remaining_frames if max_frames <= 0 else min(remaining_frames, max_frames)
 
     print("\n" + "=" * 78)
-    print(" [ADAS v3 야간 도심 차선 검출 비디오 파이프라인 - 체커보드 보정 & 클린 뷰 & 칼만 필터]")
+    print(" [ADAS v3 야간 도심 차선 검출 비디오 파이프라인 - 체커보드 보정 & 클린 뷰]")
     print(f" - 입력 영상: {video_path}")
     print(f" - 처리 제원: {proc_w}x{proc_h} @ {fps:.1f} FPS | 대상 프레임: {frames_to_process}")
     print(f" - [카메라 캘리브레이션] 렌즈 왜곡 보정: {calib_status_str}")
     print(f" - [수정점 1] 버드아이 뷰(BEV) 삭제 완료")
     print(f" - [수정점 2] 지정 사다리꼴 ROI 적용 (y: 0.65~0.88, 상단 0.44~0.56, 하단 0.18~0.82) & 꼬임 방지")
     print(f" - [수정점 3] 모든 HUD 삭제 & 고시인성 네온 에메랄드 차로 & ROI-CLAHE")
-    print(f" - [시계열 칼만 필터] 차선 미검출 시 궤적 예측(Predict) 복원 활성화")
     print(f" - 저장 경로: {output_path}")
     if show_preview:
         print(" - 실시간 모니터링: 활성화 ('q' 또는 ESC 키로 중단 가능)")
@@ -807,7 +790,7 @@ def run_video_pipeline(
             resized = cv2.resize(frame, (proc_w, proc_h), interpolation=cv2.INTER_AREA)
 
             # 파이프라인 처리 (체커보드 렌즈 왜곡 보정 -> 사다리꼴 ROI -> CLAHE -> Canny -> Hough -> EMA Smoothing)
-            res_frame, canny_roi, status, cur_gray_roi = process_frame(
+            res_frame, status, cur_gray_roi = process_frame(
                 resized,
                 tracker,
                 crosswalk_detector,
@@ -854,7 +837,7 @@ if __name__ == "__main__":
                         help="실행 모드: run(비디오 차선 검출 파이프라인), calibrate(체커보드 캘리브레이션 전용)")
     parser.add_argument("--input", type=str, default=r"c:\vision_work\video\Test_Video_2.mp4",
                         help="입력 비디오 파일 경로")
-    parser.add_argument("--output", type=str, default=r"c:\vision_work\output_Test_Video_2_ch.mp4",
+    parser.add_argument("--output", type=str, default=r"c:\vision_work\output_Test_Video_2_v3_clean_lane.mp4",
                         help="출력 비디오 파일 경로")
     parser.add_argument("--start_frame", type=int, default=0, help="시작 프레임 번호")
     parser.add_argument("--max_frames", type=int, default=0, help="처리할 최대 프레임 수 (0은 전체 처리)")

@@ -17,8 +17,10 @@ from .geometry import get_roi_polygon
 class HUDVisualizer:
     """Renders professional autonomous driving HUD overlays on video frames."""
 
-    def __init__(self, cfg: Optional[Dict[str, Any]] = None):
+    def __init__(self, cfg: Optional[Dict[str, Any]] = None, lane_renderer: Any = None):
         self.cfg = cfg or {}
+        self.lane_renderer = lane_renderer
+        self.lane_hud_fps = 0.0
         self.vis_cfg = self.cfg.get("visualization", {})
         self.show_corridor = self.vis_cfg.get("show_lane_polygon", True)
         self.show_center_path = self.vis_cfg.get("show_center_path", True)
@@ -26,6 +28,8 @@ class HUDVisualizer:
         self.show_debug_minimap = self.vis_cfg.get("show_debug_minimap", True)
         self.show_objects = self.vis_cfg.get("show_objects", True)
         self.show_bbox = self.vis_cfg.get("show_bbox", True)
+        # Lane drawing is owned by lane problem fix.py in the main pipeline.
+        self.show_lane_overlay = False
         self.show_object_labels = self.vis_cfg.get(
             "show_object_labels",
             self.vis_cfg.get("show_box_labels", self.cfg.get("detector", {}).get("show_labels", True))
@@ -43,7 +47,11 @@ class HUDVisualizer:
         state: DrivingStateResult,
         timings: FrameTimings,
         quality: QualityMetric,
-        debug_edge_map: Optional[np.ndarray] = None
+        debug_edge_map: Optional[np.ndarray] = None,
+        lane_left_fit: Optional[List[float]] = None,
+        lane_right_fit: Optional[List[float]] = None,
+        lane_is_crosswalk: bool = False,
+        lane_debug: Optional[Dict[str, Any]] = None
     ) -> np.ndarray:
         """Composes all visual components onto the frame."""
         h, w = frame.shape[:2]
@@ -53,7 +61,7 @@ class HUDVisualizer:
         roi_corners = get_roi_polygon(w, h, self.cfg.get("roi"))
 
         # 1. Draw Dual ROI Guidelines & Bounding Boxes (cv1021.py) or default ROI
-        if lane.left_corners is not None and lane.right_corners is not None:
+        if self.show_lane_overlay and lane.left_corners is not None and lane.right_corners is not None:
             if not lane.is_crosswalk:
                 if self.show_bbox:
                     if lane.left_bbox is not None:
@@ -70,12 +78,12 @@ class HUDVisualizer:
 
                 cv2.polylines(overlay, [lane.left_corners], isClosed=True, color=(255, 200, 0), thickness=1)
                 cv2.polylines(overlay, [lane.right_corners], isClosed=True, color=(0, 200, 255), thickness=1)
-        else:
+        elif self.show_lane_overlay:
             cv2.polylines(overlay, [roi_corners], isClosed=True, color=(70, 70, 70), thickness=1)
 
 
         # 2. Draw Driving Corridor & Lane Boundaries
-        if self.show_corridor and lane.left_line and lane.right_line and lane.status != "LOST":
+        if self.show_lane_overlay and self.show_corridor and lane.left_line and lane.right_line and lane.status != "LOST":
             lx1, ly1, lx2, ly2 = lane.left_line
             rx1, ry1, rx2, ry2 = lane.right_line
             corridor_pts = np.array([[
@@ -95,15 +103,15 @@ class HUDVisualizer:
         vis = cv2.addWeighted(overlay, 0.30, vis, 0.70, 0)
 
         # Draw Left/Right Lane lines on top of blend
-        if lane.left_line:
+        if self.show_lane_overlay and lane.left_line:
             lx1, ly1, lx2, ly2 = lane.left_line
             cv2.line(vis, (lx1, ly1), (lx2, ly2), (255, 120, 0), 4, cv2.LINE_AA)
-        if lane.right_line:
+        if self.show_lane_overlay and lane.right_line:
             rx1, ry1, rx2, ry2 = lane.right_line
             cv2.line(vis, (rx1, ry1), (rx2, ry2), (0, 100, 255), 4, cv2.LINE_AA)
 
         # Draw Center Driving Path
-        if self.show_center_path and lane.lane_center_x is not None and lane.status != "LOST":
+        if self.show_lane_overlay and self.show_center_path and lane.lane_center_x is not None and lane.status != "LOST":
             cx = int(lane.lane_center_x)
             top_y = int(roi_corners[0][0][1])
             bot_y = int(roi_corners[0][3][1])
@@ -116,7 +124,7 @@ class HUDVisualizer:
             cv2.line(vis, (frame_center_x, bot_y), (cx, bot_y), (0, 255, 255), 2)
 
         # 3. Draw Road Markings (Crosswalks and Stoplines)
-        if markings.crosswalk_detected:
+        if markings.crosswalk_detected and self.lane_renderer is None:
             for cbox in markings.crosswalk_boxes:
                 bx1, by1, bx2, by2 = cbox
                 cv2.rectangle(vis, (bx1, by1), (bx2, by2), (0, 240, 240), 2)
@@ -270,5 +278,19 @@ class HUDVisualizer:
             cv2.rectangle(vis, (mx, my), (mx + mw, my + mh), (0, 220, 255), 2)
             cv2.putText(vis, "Dual Canny Minimap", (mx + 8, my + 18),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 220, 255), 1, cv2.LINE_AA)
+
+        # Lane problem fix.py owns lane/crosswalk rendering when supplied.
+        if self.lane_renderer is not None:
+            effective_fps = (1000.0 / timings.total_ms) if timings.total_ms > 0 else 0.0
+            self.lane_hud_fps = 0.9 * self.lane_hud_fps + 0.1 * effective_fps
+            vis = self.lane_renderer(
+                vis,
+                lane_left_fit,
+                lane_right_fit,
+                lane_is_crosswalk,
+                lane_debug or {},
+                fps=self.lane_hud_fps,
+                show_roi_boxes=True
+            )
 
         return vis
