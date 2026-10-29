@@ -331,7 +331,7 @@ class DecisionFusion:
                 cx, cy = obj.center
                 x1, y1, x2, y2 = obj.bbox
                 # In or near our lane corridor
-                if abs(cx - lane_center) < (lane_w * 0.7):
+                if abs(cx - lane_center) < (lane_w * 0.45): # (보행자 침범 범위 축소 - 261029)
                     if y2 >= (h * 0.80):
                         pedestrians_near = True
                     elif y2 >= (h * 0.65):
