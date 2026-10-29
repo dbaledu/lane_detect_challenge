@@ -63,9 +63,10 @@ class LanesDetectorV1EMAdapter:
         if self.crosswalk_detector is None:
             self.crosswalk_detector = self.module.CrosswalkAndMotionDetector(w, h)
 
-        _, status, gray_roi = self.module.process_frame(
+        rendered_frame, status, gray_roi = self.module.process_frame(
             frame, self.tracker, self.crosswalk_detector, self.clahe, self.prev_gray_roi, calibrator=None
         )
+        frame[:] = rendered_frame
         self.prev_gray_roi = gray_roi
 
         y_top = float(h * 0.65)
@@ -104,10 +105,10 @@ def load_lane_detector(cfg: dict):
     name = str(lane_cfg.get("detector", "lane_line")).strip().lower()
     if name in ("lane_line", "lane-line", "lane line.py"):
         module = load_lane_module("lane line.py", "src.lane.lane_line")
-        return module.HighStabilityLaneTracker(cfg), module, name
+        return module.HighStabilityLaneTracker(cfg), module, "lane_line"
     if name in ("lanes_detector_v1_em", "lanes_detector_v1_em.py", "lanes_detector_v1_EM", "em"):
         module = load_lane_module("lanes_detector_v1_EM.py", "src.lane.lanes_detector_v1_EM")
-        return LanesDetectorV1EMAdapter(module, cfg), None, name
+        return LanesDetectorV1EMAdapter(module, cfg), None, "lanes_detector_v1_em"
     raise ValueError(f"Unknown lane.detector '{name}'. Use 'lane_line' or 'lanes_detector_v1_em'.")
 
 
@@ -201,7 +202,12 @@ def run_pipeline(cfg: dict, args: argparse.Namespace):
     motion_estimator = MotionEstimator(cfg)
     decision_fusion = DecisionFusion(cfg)
     lane_renderer = lane_module.draw_lane_hud if lane_module is not None else None
-    visualizer = HUDVisualizer(cfg, lane_renderer=lane_renderer)
+    lane_output_enabled = lane_detector_name != "lanes_detector_v1_em"
+    visualizer = HUDVisualizer(
+        cfg,
+        lane_renderer=lane_renderer,
+        lane_output_enabled=lane_output_enabled,
+    )
 
     # 3. Initialize Output Writers
     video_writer = AnnotatedVideoWriter(

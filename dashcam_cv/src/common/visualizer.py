@@ -17,9 +17,11 @@ from .geometry import get_roi_polygon
 class HUDVisualizer:
     """Renders professional autonomous driving HUD overlays on video frames."""
 
-    def __init__(self, cfg: Optional[Dict[str, Any]] = None, lane_renderer: Any = None):
+    def __init__(self, cfg: Optional[Dict[str, Any]] = None, lane_renderer: Any = None,
+                 lane_output_enabled: bool = True):
         self.cfg = cfg or {}
         self.lane_renderer = lane_renderer
+        self.lane_output_enabled = lane_output_enabled
         self.lane_hud_fps = 0.0
         self.vis_cfg = self.cfg.get("visualization", {})
         self.show_corridor = self.vis_cfg.get("show_lane_polygon", True)
@@ -124,7 +126,7 @@ class HUDVisualizer:
             cv2.line(vis, (frame_center_x, bot_y), (cx, bot_y), (0, 255, 255), 2)
 
         # 3. Draw Road Markings (Crosswalks and Stoplines)
-        if markings.crosswalk_detected and self.lane_renderer is None:
+        if markings.crosswalk_detected and self.lane_output_enabled:
             for cbox in markings.crosswalk_boxes:
                 bx1, by1, bx2, by2 = cbox
                 cv2.rectangle(vis, (bx1, by1), (bx2, by2), (0, 240, 240), 2)
@@ -282,7 +284,7 @@ class HUDVisualizer:
         # Render the selected lane implementation inside the common visualizer.
         effective_fps = (1000.0 / timings.total_ms) if timings.total_ms > 0 else 0.0
         self.lane_hud_fps = 0.9 * self.lane_hud_fps + 0.1 * effective_fps
-        if self.lane_renderer is not None:
+        if self.lane_output_enabled and self.lane_renderer is not None:
             vis = self.lane_renderer(
                 vis,
                 lane_left_fit,
@@ -292,7 +294,7 @@ class HUDVisualizer:
                 fps=self.lane_hud_fps,
                 show_roi_boxes=True
             )
-        elif lane_left_fit is not None or lane_right_fit is not None:
+        elif self.lane_output_enabled and (lane_left_fit is not None or lane_right_fit is not None):
             top_y = int(h * 0.65)
             bot_y = int(h * 0.88)
 
