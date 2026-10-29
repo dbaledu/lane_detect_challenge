@@ -109,7 +109,7 @@ visualization:
   display_window: false     # 실시간 GUI 창 표시 여부 (헤드리스 환경에서는 false 권장)
   show_lane_polygon: true   # 주행 영역 반투명 채우기
   show_center_path: true    # 주행 중심 경로선 표시
-  show_hud_card: false       # 주행 상태 및 지표 대시보드 표시
-  show_debug_minimap: false  # 우측 상단 ROI 에지 미니맵 표시
-  show_objects: false        # 객체 검출 바운딩 박스 표시 여부
-  show_object_labels: false  # 객체 검출 바운딩 박스 라벨(태그 텍스트) 표시 여부
+  show_hud_card: true       # 주행 상태 및 지표 대시보드 표시
+  show_debug_minimap: true  # 우측 상단 ROI 에지 미니맵 표시
+  show_objects: true       # 객체 검출 바운딩 박스 표시 여부
+  show_object_labels: true  # 객체 검출 바운딩 박스 라벨(태그 텍스트) 표시 여부
