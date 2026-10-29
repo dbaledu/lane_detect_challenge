@@ -688,7 +688,7 @@ class LaneDetector:
             "right_bbox": right_bbox,
             "left_edges": left_edges,
             "right_edges": right_edges,
-            "combined_edges": combined_edges,
+           # "combined_edges": combined_edges,
             "left_lines": left_lines_orig,
             "right_lines": right_lines_orig,
             "left_metrics": left_metrics,
@@ -1033,7 +1033,7 @@ if __name__ == "__main__":
         # 대안 경로 자동 탐색
         candidates = [
             video_to_run,
-            "Test_Video_2.mp4",
+            "data/Test_Video_2.mp4",
             "Test_Video_2_05bb47dc.mp4",
             "/public/assets/aistudio/Test_Video_2_05bb47dc.mp4",
             "public/assets/aistudio/Test_Video_2_05bb47dc.mp4",
