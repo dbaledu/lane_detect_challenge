@@ -28,7 +28,7 @@ class HUDVisualizer:
         self.show_debug_minimap = self.vis_cfg.get("show_debug_minimap", True)
         self.show_objects = self.vis_cfg.get("show_objects", True)
         self.show_bbox = self.vis_cfg.get("show_bbox", True)
-        # Lane drawing is owned by lane problem fix.py in the main pipeline.
+        # Lane drawing is owned by the selected lane implementation injected by main.
         self.show_lane_overlay = False
         self.show_object_labels = self.vis_cfg.get(
             "show_object_labels",
@@ -279,10 +279,10 @@ class HUDVisualizer:
             cv2.putText(vis, "Dual Canny Minimap", (mx + 8, my + 18),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 220, 255), 1, cv2.LINE_AA)
 
-        # Lane problem fix.py owns lane/crosswalk rendering when supplied.
+        # Render the selected lane implementation inside the common visualizer.
+        effective_fps = (1000.0 / timings.total_ms) if timings.total_ms > 0 else 0.0
+        self.lane_hud_fps = 0.9 * self.lane_hud_fps + 0.1 * effective_fps
         if self.lane_renderer is not None:
-            effective_fps = (1000.0 / timings.total_ms) if timings.total_ms > 0 else 0.0
-            self.lane_hud_fps = 0.9 * self.lane_hud_fps + 0.1 * effective_fps
             vis = self.lane_renderer(
                 vis,
                 lane_left_fit,
@@ -292,5 +292,48 @@ class HUDVisualizer:
                 fps=self.lane_hud_fps,
                 show_roi_boxes=True
             )
+        elif lane_left_fit is not None or lane_right_fit is not None:
+            top_y = int(h * 0.65)
+            bot_y = int(h * 0.88)
+
+            def fit_x(fit, y):
+                if fit is None:
+                    return None
+                if len(fit) == 3:
+                    return fit[0] * y * y + fit[1] * y + fit[2]
+                return fit[0] * y + fit[1]
+
+            if not lane_is_crosswalk:
+                left_x_top = fit_x(lane_left_fit, top_y) if lane_left_fit is not None else None
+                left_x_bot = fit_x(lane_left_fit, bot_y) if lane_left_fit is not None else None
+                right_x_top = fit_x(lane_right_fit, top_y) if lane_right_fit is not None else None
+                right_x_bot = fit_x(lane_right_fit, bot_y) if lane_right_fit is not None else None
+
+                if left_x_top is not None and right_x_top is not None:
+                    corridor = np.array([
+                        [(int(left_x_top), top_y), (int(right_x_top), top_y),
+                         (int(right_x_bot), bot_y), (int(left_x_bot), bot_y)]
+                    ], dtype=np.int32)
+                    overlay = vis.copy()
+                    cv2.fillPoly(overlay, corridor, (50, 255, 120))
+                    cv2.addWeighted(overlay, 0.28, vis, 0.72, 0, vis)
+                    cx_top = int((left_x_top + right_x_top) / 2)
+                    cx_bot = int((left_x_bot + right_x_bot) / 2)
+                    cv2.line(vis, (cx_top, top_y), (cx_bot, bot_y), (255, 255, 220), 2, cv2.LINE_AA)
+
+                if left_x_top is not None:
+                    cv2.line(vis, (int(left_x_top), top_y), (int(left_x_bot), bot_y), (255, 210, 0), 6, cv2.LINE_AA)
+                    cv2.line(vis, (int(left_x_top), top_y), (int(left_x_bot), bot_y), (255, 255, 255), 2, cv2.LINE_AA)
+                if right_x_top is not None:
+                    cv2.line(vis, (int(right_x_top), top_y), (int(right_x_bot), bot_y), (30, 70, 255), 6, cv2.LINE_AA)
+                    cv2.line(vis, (int(right_x_top), top_y), (int(right_x_bot), bot_y), (255, 255, 255), 2, cv2.LINE_AA)
+
+            else:
+                banner_w, banner_h = 360, 42
+                bx = (w - banner_w) // 2
+                by = int(h * 0.52)
+                cv2.rectangle(vis, (bx, by), (bx + banner_w, by + banner_h), (0, 0, 220), -1)
+                cv2.putText(vis, "CROSSWALK DETECTED - HOLD / STOP", (bx + 18, by + 28),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 255, 255), 2, cv2.LINE_AA)
 
         return vis

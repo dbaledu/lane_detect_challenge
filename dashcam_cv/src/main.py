@@ -33,22 +33,81 @@ from src.output.csv_logger import CSVLogger
 from src.output.metrics import MetricsCollector
 
 
-def load_lane_problem_fix_detector(cfg: dict):
-    """Spaces in lane problem fix.py prevent normal package import, so load it by file path."""
-    module_path = Path(__file__).resolve().parent / "lane" / "lane problem fix.py"
-    module_name = "src.lane.lane_problem_fix"
-
+def load_lane_module(filename: str, module_name: str):
+    module_path = Path(__file__).resolve().parent / "lane" / filename
     if module_name in sys.modules:
-        return sys.modules[module_name].LaneDetector(cfg)
-
+        return sys.modules[module_name]
     spec = importlib.util.spec_from_file_location(module_name, module_path)
     if spec is None or spec.loader is None:
-        raise ImportError(f"Cannot load lane detector module: {module_path}")
-
+        raise ImportError(f"Cannot load lane module: {module_path}")
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = module
     spec.loader.exec_module(module)
-    return module.LaneDetector(cfg)
+    return module
+
+
+class LanesDetectorV1EMAdapter:
+    """Adapts lanes_detector_v1_EM.py to the pipeline's detector interface."""
+
+    def __init__(self, module, cfg: dict):
+        self.module = module
+        self.cfg = cfg
+        self.tracker = module.ADASLaneTrackerV3(max_hold_frames=35, alpha=0.22)
+        self.clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+        self.crosswalk_detector = None
+        self.prev_gray_roi = None
+
+    def detect(self, frame: np.ndarray):
+        h, w = frame.shape[:2]
+        if self.crosswalk_detector is None:
+            self.crosswalk_detector = self.module.CrosswalkAndMotionDetector(w, h)
+
+        _, status, gray_roi = self.module.process_frame(
+            frame, self.tracker, self.crosswalk_detector, self.clahe, self.prev_gray_roi, calibrator=None
+        )
+        self.prev_gray_roi = gray_roi
+
+        y_top = float(h * 0.65)
+        y_bottom = float(h * 0.88)
+
+        def line_to_fit(line):
+            if line is None:
+                return None
+            x_bottom, y_bottom_line, x_top, y_top_line = line
+            dy = y_top_line - y_bottom_line
+            if abs(dy) < 1e-4:
+                return None
+            m = (x_top - x_bottom) / dy
+            c = x_top - m * y_top_line
+            return [float(m), float(c)]
+
+        left_line = getattr(self.tracker, "left_line", None)
+        right_line = getattr(self.tracker, "right_line", None)
+        left_fit = line_to_fit(left_line.tolist() if hasattr(left_line, "tolist") else left_line)
+        right_fit = line_to_fit(right_line.tolist() if hasattr(right_line, "tolist") else right_line)
+        is_crosswalk = bool(self.crosswalk_detector.is_crosswalk)
+
+        debug_info = {
+            "confidence": 0.7 if status == "TRACKING" else (0.45 if left_fit is not None or right_fit is not None else 0.0),
+            "is_crosswalk": is_crosswalk,
+            "cw_boxes": [],
+            "held_left": left_fit is not None and "HOLD" in status,
+            "held_right": right_fit is not None and "HOLD" in status,
+            "combined_edges": None,
+        }
+        return left_fit, right_fit, is_crosswalk, debug_info
+
+
+def load_lane_detector(cfg: dict):
+    lane_cfg = cfg.get("lane", {})
+    name = str(lane_cfg.get("detector", "lane_line")).strip().lower()
+    if name in ("lane_line", "lane-line", "lane line.py"):
+        module = load_lane_module("lane line.py", "src.lane.lane_line")
+        return module.HighStabilityLaneTracker(cfg), module, name
+    if name in ("lanes_detector_v1_em", "lanes_detector_v1_em.py", "lanes_detector_v1_EM", "em"):
+        module = load_lane_module("lanes_detector_v1_EM.py", "src.lane.lanes_detector_v1_EM")
+        return LanesDetectorV1EMAdapter(module, cfg), None, name
+    raise ValueError(f"Unknown lane.detector '{name}'. Use 'lane_line' or 'lanes_detector_v1_em'.")
 
 
 def load_config(config_path: str) -> dict:
@@ -70,6 +129,7 @@ def parse_args():
     parser.add_argument("--width", type=int, help="Override target frame width (e.g. 640 or 960)")
     parser.add_argument("--stride", type=int, help="Override frame stride (e.g. 1, 2, 3)")
     parser.add_argument("--detect-interval", type=int, help="Override object detection frame interval (e.g. 1, 5, 10)")
+    parser.add_argument("--lane-detector", choices=["lane_line", "lanes_detector_v1_em"], help="Select lane detection implementation")
     parser.add_argument("--max-frames", type=int, help="Process only first N frames")
     parser.add_argument("--display", action="store_true", help="Display GUI playback window")
     parser.add_argument("--no-display", action="store_true", help="Disable GUI playback window")
@@ -89,6 +149,8 @@ def run_pipeline(cfg: dict, args: argparse.Namespace):
         cfg["video"]["max_frames"] = args.max_frames
     if args.detect_interval:
         cfg["detector"]["detect_interval"] = args.detect_interval
+    if args.lane_detector:
+        cfg.setdefault("lane", {})["detector"] = args.lane_detector
     if args.display:
         cfg["visualization"]["display_window"] = True
     elif args.no_display:
@@ -129,8 +191,7 @@ def run_pipeline(cfg: dict, args: argparse.Namespace):
     # 2. Initialize Core Perception Modules
     preprocessor = FramePreprocessor(cfg)
     quality_analyzer = QualityAnalyzer(cfg)
-    lane_detector = load_lane_problem_fix_detector(cfg)
-    lane_problem_fix_module = sys.modules["src.lane.lane_problem_fix"]
+    lane_detector, lane_module, lane_detector_name = load_lane_detector(cfg)
     lane_tracker = LaneTracker(cfg)
     lane_change_detector = LaneChangeDetector(cfg)
     object_detector = ObjectDetector(cfg)
@@ -138,7 +199,8 @@ def run_pipeline(cfg: dict, args: argparse.Namespace):
     road_markings = RoadMarkingDetector(cfg)
     motion_estimator = MotionEstimator(cfg)
     decision_fusion = DecisionFusion(cfg)
-    visualizer = HUDVisualizer(cfg, lane_renderer=lane_problem_fix_module.draw_lane_hud)
+    lane_renderer = lane_module.draw_lane_hud if lane_module is not None else None
+    visualizer = HUDVisualizer(cfg, lane_renderer=lane_renderer)
 
     # 3. Initialize Output Writers
     video_writer = AnnotatedVideoWriter(
@@ -173,7 +235,7 @@ def run_pipeline(cfg: dict, args: argparse.Namespace):
             quality = quality_analyzer.analyze(frame, gray)
             t_preprocess = (time.perf_counter() - t0) * 1000.0
 
-            # Lane + crosswalk detection (lane problem fix.py) and lane tracking
+            # Lane + crosswalk detection and lane tracking
             t0 = time.perf_counter()
             curr_left_fit, curr_right_fit, is_crosswalk, lane_debug = lane_detector.detect(frame)
             lane_res = lane_tracker.update(
@@ -191,8 +253,7 @@ def run_pipeline(cfg: dict, args: argparse.Namespace):
             # Road Markings (Crosswalks and Stop lines)
             t0 = time.perf_counter()
             markings_res = road_markings.detect(frame, enhanced, edges)
-            # lane problem fix.py owns crosswalk detection; the road-markings
-            # module continues to own stop-line detection.
+            # Selected lane detector owns crosswalk detection; road-markings owns stop lines.
             lane_cw_boxes = lane_debug.get("cw_boxes", []) if is_crosswalk else []
             markings_res.crosswalk_detected = bool(is_crosswalk)
             markings_res.crosswalk_boxes = lane_cw_boxes

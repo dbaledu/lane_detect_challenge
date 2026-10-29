@@ -109,6 +109,10 @@ python src/main.py --display
 
 # 빠른 벤치마크 테스트 (앞쪽 100프레임만 처리)
 python src/main.py --max-frames 100 --no-display
+
+# 차선 검출 알고리즘 선탯
+python src/main.py --lane-detector lane_line
+python src/main.py --lane-detector lanes_detector_v1_em
 ```
 
 ### 3. 단위 테스트 실행
