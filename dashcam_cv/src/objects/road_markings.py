@@ -28,6 +28,14 @@ class RoadMarkingDetector:
         self.last_stopline_box: Optional[Tuple[int, int, int, int]] = None
         self.stopline_missing_frames = 0
 
+    def reset_stopline_state(self) -> None:
+        """정지 상태에서 정지선 표시와 과거 추적 상태를 모두 초기화합니다."""
+        self.stopline_history.clear()
+        self.stopline_box_history.clear()
+        self.last_stopline_y = None
+        self.last_stopline_box = None
+        self.stopline_missing_frames = 0
+
     def detect(
         self,
         frame: np.ndarray,

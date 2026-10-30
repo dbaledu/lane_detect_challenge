@@ -93,6 +93,7 @@ state:
   flow_decel_slope: -0.04   # 시간 창 내 이동량 기울기가 음수일 때 감속 의심
   flow_start_threshold: 1.25 # 정지 후 재출발 판정 임계값
   window_size_frames: 25    # 상태 판별용 시계열 시간 창 (약 0.8초)
+  motion_window_size_frames: 5 # Optical Flow 이동량 중앙값 평활 프레임
   stopped_persistence_frames: 15 # 정지 상태 확정 필요 최소 프레임수
   # 깜빡임(Flickering) 방지 및 안정화 설정
   state_hold_frames: 12     # 경고/감속/정지 상태 전환 시 최소 유지 프레임수 (~0.4초)
@@ -114,5 +115,5 @@ visualization:
   show_center_path: true    # 주행 중심 경로선 표시
   show_hud_card: true       # 주행 상태 및 지표 대시보드 표시
   show_debug_minimap: true  # 우측 상단 ROI 에지 미니맵 표시
-  show_objects: false       # 객체 검출 바운딩 박스 표시 여부
-  show_object_labels: false  # 객체 검출 바운딩 박스 라벨(태그 텍스트) 표시 여부
+  show_objects: true       # 객체 검출 바운딩 박스 표시 여부
+  show_object_labels: true  # 객체 검출 바운딩 박스 라벨(태그 텍스트) 표시 여부

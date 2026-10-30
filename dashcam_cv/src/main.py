@@ -15,7 +15,7 @@ import numpy as np
 # Ensure project root is on sys.path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.common.data_models import FrameTimings
+from src.common.data_models import FrameTimings, LaneResult, RoadMarkingResult
 from src.common.geometry import get_roi_polygon
 from src.common.visualizer import HUDVisualizer
 from src.video.video_reader import VideoReader
@@ -232,6 +232,10 @@ def run_pipeline(cfg: dict, args: argparse.Namespace):
 
     display_active = cfg.get("visualization", {}).get("display_window", False)
     paused = False
+    previous_ego_state = "UNCERTAIN"
+    stopped_confirm_frames = max(1, int(cfg.get("state", {}).get("stopped_persistence_frames", 3)))
+    stopped_candidate_count = 0
+    stopped_confirmed = False
 
     try:
         for ok, frame, frame_idx, timestamp in reader.frames(max_frames=max_frames):
@@ -246,38 +250,54 @@ def run_pipeline(cfg: dict, args: argparse.Namespace):
             quality = quality_analyzer.analyze(frame, gray)
             t_preprocess = (time.perf_counter() - t0) * 1000.0
 
+            # First verify the stop over consecutive frames; only the confirmed
+            # state is allowed to skip lane/stopline detection in the next frame.
+            freeze_stopped = stopped_confirmed
+
             # Lane + crosswalk detection and lane tracking
             t0 = time.perf_counter()
-            if lane_detector_name == "lanes_detector_v1_em":
-                curr_left_fit, curr_right_fit, is_crosswalk, lane_debug = lane_detector.detect(
-                    frame, gray=gray, enhanced=enhanced, edges=edges
+            curr_left_fit = None
+            curr_right_fit = None
+            is_crosswalk = False
+            lane_debug = {}
+
+            if not freeze_stopped:
+                if lane_detector_name == "lanes_detector_v1_em":
+                    curr_left_fit, curr_right_fit, is_crosswalk, lane_debug = lane_detector.detect(
+                        frame, gray=gray, enhanced=enhanced, edges=edges
+                    )
+                else:
+                    curr_left_fit, curr_right_fit, is_crosswalk, lane_debug = lane_detector.detect(frame)
+
+                lane_res = lane_tracker.update(
+                    curr_left_fit=curr_left_fit,
+                    curr_right_fit=curr_right_fit,
+                    raw_confidence=lane_debug.get("confidence", 0.0),
+                    w=meta.target_width,
+                    h=meta.target_height,
+                    is_crosswalk=is_crosswalk,
+                    debug_info=lane_debug,
                 )
             else:
-                curr_left_fit, curr_right_fit, is_crosswalk, lane_debug = lane_detector.detect(frame)
-            lane_res = lane_tracker.update(
-                curr_left_fit=curr_left_fit,
-                curr_right_fit=curr_right_fit,
-                raw_confidence=lane_debug.get("confidence", 0.0),
-                w=meta.target_width,
-                h=meta.target_height,
-                is_crosswalk=is_crosswalk,
-                debug_info=lane_debug,
-            )
+                lane_res = LaneResult(status="STOPPED_SKIPPED", is_uncertain=True)
+
             lane_change_st = lane_change_detector.update(lane_res)
             t_lane = (time.perf_counter() - t0) * 1000.0
 
             # Road Markings (Crosswalks and Stop lines)
             t0 = time.perf_counter()
-            # 횡단보도는 선택된 차선 모듈이 담당하며, 노면 모듈은 정지선만 담당합니다.
-            lane_cw_boxes = lane_debug.get("cw_boxes", []) if is_crosswalk else []
-            markings_res = road_markings.detect(
-                frame,
-                enhanced,
-                edges,
-                crosswalk_boxes=lane_cw_boxes,
-            )
-            markings_res.crosswalk_detected = bool(is_crosswalk)
-            markings_res.crosswalk_boxes = lane_cw_boxes
+            if freeze_stopped:
+                road_markings.reset_stopline_state()
+                markings_res = RoadMarkingResult()
+            else:
+                # 횡단보도는 선택된 차선 모듈이 담당하며, 노면 모듈은 정지선만 담당합니다.
+                lane_cw_boxes = lane_debug.get("cw_boxes", []) if is_crosswalk else []
+                markings_res = road_markings.detect(
+                    frame,
+                    enhanced,
+                    edges,
+                    crosswalk_boxes=lane_cw_boxes,
+                )
             t_markings = (time.perf_counter() - t0) * 1000.0
 
             # Object Detection
@@ -302,6 +322,18 @@ def run_pipeline(cfg: dict, args: argparse.Namespace):
             state_res = decision_fusion.evaluate(
                 motion_res, quality, lane_res, tracked_objects, markings_res, lane_change_st, frame.shape, frame=frame
             )
+            previous_ego_state = state_res.ego_state
+
+            if state_res.ego_state == "NORMAL_DRIVING":
+                stopped_candidate_count = 0
+                stopped_confirmed = False
+            elif state_res.ego_state == "STOPPED_SUSPECTED":
+                stopped_candidate_count += 1
+                if stopped_candidate_count >= stopped_confirm_frames:
+                    stopped_confirmed = True
+            elif state_res.ego_state == "UNCERTAIN" and not stopped_confirmed:
+                stopped_candidate_count = 0
+
             t_decision = (time.perf_counter() - t0) * 1000.0
 
             # HUD Visualization Overlay
