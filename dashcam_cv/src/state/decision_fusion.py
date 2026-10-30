@@ -16,6 +16,11 @@ from ..common.data_models import (
 class DecisionFusion:
     """Integrates multi-modal perceptions into unified situational decisions with anti-flicker filtering."""
 
+    # [NEW] Traffic light HSV color ranges (Phase 1 / Phase 2 통합 상수)
+    _TL_RED_LOW = (0, 10)       # Hue range: lower red wrap
+    _TL_RED_HIGH = (165, 180)   # Hue range: upper red wrap
+    _TL_GREEN = (40, 95)        # Hue range: green
+
     def __init__(self, cfg: Optional[Dict[str, Any]] = None):
         self.cfg = cfg or {}
         st_cfg = self.cfg.get("state", {})
@@ -50,6 +55,28 @@ class DecisionFusion:
         self.tl_candidate_color: Optional[str] = None
         self.tl_candidate_count: int = 0
 
+    # [NEW] Phase 1 / Phase 2 공용 HSV 마스크 빌더 (중복 제거 및 범위 통일)
+    def _build_color_masks(
+        self, hsv: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Builds unified R/G binary masks with clamped saturation/value thresholds.
+
+        Note: Yellow mask removed to eliminate false positives from streetlights
+        and electronic billboards.
+        """
+        min_s = min(self.tl_min_sat, 110)
+        min_v = min(self.tl_min_val, 150)
+
+        mask_r = cv2.bitwise_or(
+            cv2.inRange(hsv, np.array([self._TL_RED_LOW[0], min_s, min_v]),
+                             np.array([self._TL_RED_LOW[1], 255, 255])),
+            cv2.inRange(hsv, np.array([self._TL_RED_HIGH[0], min_s, min_v]),
+                             np.array([self._TL_RED_HIGH[1], 255, 255]))
+        )
+        mask_g = cv2.inRange(hsv, np.array([self._TL_GREEN[0], min_s, min_v]),
+                                  np.array([self._TL_GREEN[1], 255, 255]))
+        return mask_r, mask_g
+
     def _classify_tl_crop(
         self,
         crop: np.ndarray,
@@ -62,19 +89,10 @@ class DecisionFusion:
             return None, 0.0, None
 
         hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-        min_s = min(self.tl_min_sat, 110)
-        min_v = min(self.tl_min_val, 150)
-
-        mask_r = cv2.bitwise_or(
-            cv2.inRange(hsv, np.array([0, min_s, min_v]), np.array([10, 255, 255])),
-            cv2.inRange(hsv, np.array([165, min_s, min_v]), np.array([180, 255, 255]))
-        )
-        mask_y = cv2.inRange(hsv, np.array([15, min_s, min_v]), np.array([35, 255, 255]))
-        mask_g = cv2.inRange(hsv, np.array([40, min_s, min_v]), np.array([95, 255, 255]))
+        mask_r, mask_g = self._build_color_masks(hsv)
 
         counts = {
             "RED": cv2.countNonZero(mask_r),
-            "YELLOW": cv2.countNonZero(mask_y),
             "GREEN": cv2.countNonZero(mask_g)
         }
         best_color = max(counts, key=counts.get)
@@ -83,7 +101,7 @@ class DecisionFusion:
         # Require at least 4 lit pixels or 2.5% of the bounding box
         box_area = cw * ch
         if max_cnt >= max(4, int(box_area * 0.025)):
-            target_mask = mask_r if best_color == "RED" else (mask_y if best_color == "YELLOW" else mask_g)
+            target_mask = mask_r if best_color == "RED" else mask_g
             pts = cv2.findNonZero(target_mask)
             if pts is not None and len(pts) > 0:
                 pts_2d = pts.reshape(-1, 2)
@@ -159,15 +177,8 @@ class DecisionFusion:
                 roi_h, roi_w = roi.shape[:2]
 
                 hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-                min_s = self.tl_min_sat
-                min_v = self.tl_min_val
-
-                mask_red1 = cv2.inRange(hsv, np.array([0, min_s, min_v]), np.array([10, 255, 255]))
-                mask_red2 = cv2.inRange(hsv, np.array([170, min_s, min_v]), np.array([180, 255, 255]))
-                mask_red = cv2.bitwise_or(mask_red1, mask_red2)
-                mask_yellow = cv2.inRange(hsv, np.array([16, min_s, min_v]), np.array([32, 255, 255]))
-                mask_green = cv2.inRange(hsv, np.array([40, min_s, min_v]), np.array([95, 255, 255]))
-                combined_mask = mask_red | mask_yellow | mask_green
+                mask_red, mask_green = self._build_color_masks(hsv)
+                combined_mask = mask_red | mask_green
 
                 if cv2.countNonZero(combined_mask) >= 6:
                     contours, _ = cv2.findContours(combined_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -202,17 +213,15 @@ class DecisionFusion:
                             continue
 
                         sub_r = mask_red[max(0, icy - r):min(roi_h, icy + r), max(0, icx - r):min(roi_w, icx + r)]
-                        sub_y = mask_yellow[max(0, icy - r):min(roi_h, icy + r), max(0, icx - r):min(roi_w, icx + r)]
                         sub_g = mask_green[max(0, icy - r):min(roi_h, icy + r), max(0, icx - r):min(roi_w, icx + r)]
 
                         r_cnt = cv2.countNonZero(sub_r)
-                        y_cnt = cv2.countNonZero(sub_y)
                         g_cnt = cv2.countNonZero(sub_g)
-                        max_c = max(r_cnt, y_cnt, g_cnt)
+                        max_c = max(r_cnt, g_cnt)
 
                         circle_area = np.pi * (r ** 2)
                         if max_c >= max(5, int(circle_area * 0.20)):
-                            c_map = {r_cnt: "RED", y_cnt: "YELLOW", g_cnt: "GREEN"}
+                            c_map = {r_cnt: "RED", g_cnt: "GREEN"}
                             best_color = c_map[max_c]
                             gcx = icx + x_start
                             gcy = icy + y_start
@@ -322,7 +331,7 @@ class DecisionFusion:
                 cx, cy = obj.center
                 x1, y1, x2, y2 = obj.bbox
                 # In or near our lane corridor
-                if abs(cx - lane_center) < (lane_w * 0.7):
+                if abs(cx - lane_center) < (lane_w * 0.45): # (보행자 침범 범위 축소 - 261029)
                     if y2 >= (h * 0.80):
                         pedestrians_near = True
                     elif y2 >= (h * 0.65):
@@ -357,15 +366,10 @@ class DecisionFusion:
             raw_reason = "전방 적색 신호등 감지 (즉시 정지 필요)"
 
         # Hazard Priority 2: Stopline near while moving
-        elif effective_stopline and ego_state in ("NORMAL_DRIVING", "DECELERATION_SUSPECTED"):
+        elif effective_stopline and ego_state == "NORMAL_DRIVING":  # [CHANGED] "DECELERATION_SUSPECTED" 제거 (도달 불가 값)
             if markings.stopline_y is not None and markings.stopline_y > (h * 0.70):
                 raw_state = "SLOW_DOWN"
                 raw_reason = "전방 정지선 근접 (감속 및 정지 준비)"
-
-        # Hazard Priority 2.5: Traffic Light Yellow
-        elif tl_result.detected and tl_result.color == "YELLOW":
-            raw_state = "SLOW_DOWN"
-            raw_reason = "전방 황색 신호등 감지 (감속 및 정지 준비)"
 
         # Hazard Priority 3: Pedestrian in mid zone
         elif pedestrians_mid:
@@ -389,7 +393,7 @@ class DecisionFusion:
                 raw_state = "NORMAL"
                 raw_reason = "선행 차량 출발 감지 (출발 준비 가능)"
 
-        elif ego_state in ("NORMAL_DRIVING", "START_DETECTED"):
+        elif ego_state == "NORMAL_DRIVING":  # [CHANGED] "START_DETECTED" 제거 (도달 불가 값)
             if lead_state == "STOPPED" or lead_state == "APPROACHING":
                 raw_state = "SLOW_DOWN"
                 raw_reason = f"전방 선행 차량({lead_state}) 접근 주의 (감속 권고)"
@@ -397,12 +401,8 @@ class DecisionFusion:
                 raw_state = "NORMAL"
                 raw_reason = "정상 주행 흐름 유지"
 
-        elif ego_state == "DECELERATION_SUSPECTED":
-            raw_state = "SLOW_DOWN"
-            if lead_state == "STOPPED":
-                raw_reason = "전방 정지 차량을 향해 감속 주행 중"
-            else:
-                raw_reason = "주행 속도 감속 진행 중"
+        # [REMOVED] ego_state == "DECELERATION_SUSPECTED" 블록 전체 제거
+        # (ego_state는 "UNCERTAIN" / "STOPPED_SUSPECTED" / "NORMAL_DRIVING"만 할당되어 도달 불가)
 
         elif ego_state == "UNCERTAIN":
             raw_state = "UNCERTAIN"

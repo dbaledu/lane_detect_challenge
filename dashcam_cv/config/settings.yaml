@@ -41,6 +41,7 @@ roi:
 
 # 5. 차선 검출 및 추적 설정 (cv1021.py Canny + 허프 maxLineGap 60 + 4D Kalman Filter)
 lane:
+  detector: "lane_line"     # lane_line 또는 lanes_detector_v1_em
   hough_threshold: 25       # 허프 변환 임계값 (cv1021.py)
   min_line_length: 20       # 최소 선분 길이 (cv1021.py)
   max_line_gap: 60          # 끊어진 선분 연결 최대 간격 (cv1021.py)
@@ -54,9 +55,9 @@ lane:
 
 # 6. 차선 변경 감지 설정
 lane_change:
-  drift_threshold_px: 35.0  # 차선 중심 편차 드리프트 임계값
-  candidate_frames: 3       # 변경 의심 진입 프레임수
-  progress_frames: 7        # 변경 진행 판정 프레임수
+  drift_threshold_px: 55.0  # 차선 중심 편차 드리프트 임계값
+  candidate_frames: 4       # 변경 의심 진입 프레임수
+  progress_frames: 10        # 변경 진행 판정 프레임수
 
 # 7. 객체 검출 모델 설정 (경량화 최적화)
 detector:
@@ -110,5 +111,5 @@ visualization:
   show_center_path: true    # 주행 중심 경로선 표시
   show_hud_card: true       # 주행 상태 및 지표 대시보드 표시
   show_debug_minimap: true  # 우측 상단 ROI 에지 미니맵 표시
-  show_objects: true        # 객체 검출 바운딩 박스 표시 여부
-  show_object_labels: true  # 객체 검출 바운딩 박스 라벨(태그 텍스트) 표시 여부
+  show_objects: false       # 객체 검출 바운딩 박스 표시 여부
+  show_object_labels: false  # 객체 검출 바운딩 박스 라벨(태그 텍스트) 표시 여부
