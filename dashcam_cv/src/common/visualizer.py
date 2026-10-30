@@ -134,21 +134,25 @@ class HUDVisualizer:
         if self.show_objects:
             for obj in objects:
                 x1, y1, x2, y2 = obj.bbox
-                if obj.is_on_crosswalk:
+                if obj.label in ("traffic light", "traffic_light") or obj.class_id == 9:
+                    box_color = (0, 255, 0)   # Green for traffic lights (objects_detector_th)
+                    box_thickness = 1
+                    tag = f"TL #{obj.track_id}"
+                elif obj.is_on_crosswalk:
                     box_color = (0, 69, 255)  # High-visibility Red-Orange for pedestrians on crosswalk
                     box_thickness = 3
                     tag = f"CROSSWALK PED #{obj.track_id} {obj.confidence:.2f}"
                 elif obj.is_lead:
-                    box_color = (0, 0, 255)  # Red for lead vehicle
+                    box_color = (0, 0, 255)   # Red for lead vehicle
                     box_thickness = 3
                     tag = f"LEAD CAR #{obj.track_id} [{obj.status}|{obj.relative_distance_trend}]"
-                elif obj.label == "person":
-                    box_color = (0, 255, 255)  # Yellow for pedestrians
+                elif obj.label == "person" or obj.class_id == 0:
+                    box_color = (0, 255, 255) # Yellow for pedestrians (objects_detector_th)
                     box_thickness = 2
                     tag = f"PED #{obj.track_id} {obj.confidence:.2f}"
                 else:
-                    box_color = (255, 180, 0)  # Cyan/Blue for other vehicles
-                    box_thickness = 2
+                    box_color = (0, 255, 255) # Yellow for other vehicles (objects_detector_th)
+                    box_thickness = 1
                     tag = f"{obj.label} #{obj.track_id}"
 
                 cv2.rectangle(vis, (x1, y1), (x2, y2), box_color, box_thickness)

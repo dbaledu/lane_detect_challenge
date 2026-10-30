@@ -43,10 +43,10 @@ class MotionEstimator:
             pad = 8
             for obj in detected_objects:
                 x1, y1, x2, y2 = obj.bbox
-                bx1 = max(0, x1 - pad)
-                by1 = max(0, y1 - pad)
-                bx2 = min(w, x2 + pad)
-                by2 = min(h, y2 + pad)
+                bx1 = max(0, int(x1) - pad)
+                by1 = max(0, int(y1) - pad)
+                bx2 = min(w, int(x2) + pad)
+                by2 = min(h, int(y2) + pad)
                 mask[by1:by2, bx1:bx2] = 0
         return mask
 

@@ -200,14 +200,24 @@ class Detector:
             out = self.predict(img)
         return out
 
-    def predict(self, img: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def predict(
+        self,
+        img: np.ndarray,
+        imgsz: Optional[int] = None,
+        classes: Optional[List[int]] = None,
+        conf: Optional[float] = None,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         # 이미지를 입력받아 바운딩 박스 좌표, 클래스 ID, 신호등/객체 점수를 반환합니다.
+        run_imgsz = imgsz if imgsz is not None else self.imgsz
+        run_classes = classes if classes is not None else self.classes
+        run_conf = conf if conf is not None else self.conf
+
         r = self.model.predict(
             source=img,
-            imgsz=self.imgsz,
-            conf=self.conf,
+            imgsz=run_imgsz,
+            conf=run_conf,
             iou=IOU,
-            classes=self.classes,
+            classes=run_classes,
             device=self.device,
             max_det=100,
             verbose=False,
@@ -226,6 +236,43 @@ class Detector:
             cls_ids = np.array([self.id_map.get(int(c), int(c)) for c in cls_ids], dtype=int)
 
         return b.xyxy.cpu().numpy(), cls_ids, b.conf.cpu().numpy()
+
+
+def verify_traffic_lights(
+    roi: np.ndarray,
+    xyxy: np.ndarray,
+    ids: np.ndarray,
+    confs: np.ndarray,
+    max_aspect: float = 5.0,
+    min_sat: int = 80,
+    min_val: int = 140,
+    min_lamp_ratio: float = 0.03,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """건물 조명 오검출 제거: 박스 모양 + 박스 안에 적/황/녹색 램프 픽셀 비율 검증 (objects_detector_th.py 호환)."""
+    if not len(ids):
+        return np.empty((0, 4), np.float32), np.empty(0, int), np.empty(0, np.float32)
+
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    lit = (
+        cv2.inRange(hsv, (0, min_sat, min_val), (12, 255, 255))
+        | cv2.inRange(hsv, (18, min_sat, min_val), (95, 255, 255))
+        | cv2.inRange(hsv, (165, min_sat, min_val), (180, 255, 255))
+    )
+
+    keep = []
+    for i, (x1, y1, x2, y2) in enumerate(xyxy.astype(int)):
+        w, h = x2 - x1, y2 - y1
+        # 검증 1) 모양: 너무 가늘고 긴 박스는 신호등이 아니라 판단
+        if min(w, h) < 1 or max(w, h) > max_aspect * min(w, h):
+            continue
+        # 검증 2) 색: 박스 안의 램프색 픽셀 수가 (최소 2개, 박스 면적의 일정 비율) 이상이어야 통과
+        if cv2.countNonZero(lit[y1:y2, x1:x2]) >= max(2, min_lamp_ratio * w * h):
+            keep.append(i)
+
+    keep = np.array(keep, dtype=int)
+    if len(keep) == 0:
+        return np.empty((0, 4), np.float32), np.empty(0, int), np.empty(0, np.float32)
+    return xyxy[keep], ids[keep], confs[keep]
 
 
 # 구버전 호환용 별칭
@@ -272,76 +319,144 @@ def build_detectors(
 
 
 class AsyncDetector:
-    # 비동기 검출 스레드.
-    # 메인 비디오 재생 스레드와 검출 연산 스레드를 분리하여,
-    # 검출 모델의 연산 속도가 비디오 FPS보다 느려도 비디오 재생이 지연되지 않도록 관리합니다.
-    def __init__(self, detectors: List[Detector], enhancer: Optional[NightEnhancer], inv_scale: float, warm_img: np.ndarray):
+    # 비동기 검출 스레드 (재생과 검출 분리, 듀얼 경로 지원)
+    def __init__(
+        self,
+        detectors: List[Detector],
+        enhancer: Optional[NightEnhancer],
+        W: int,
+        crop_h: int,
+        imgsz: int,
+        tl_imgsz: int = 1280,
+        warm_crop: Optional[np.ndarray] = None,
+        tl_cfg: Optional[Dict[str, Any]] = None,
+        # 하위 호환용 인자
+        inv_scale: Optional[float] = None,
+        warm_img: Optional[np.ndarray] = None,
+    ):
         self.dets = detectors
         self.enh = enhancer
-        self.inv_scale = inv_scale  # 축소 처리된 이미지 박스를 원본 크기로 복원하는 배율
-        self._warm_img = warm_img
+        self.imgsz = imgsz
+        self.tl_imgsz = tl_imgsz
+        self.W = W
+        self.crop_h = crop_h
+        self.tl_cfg = tl_cfg or {}
 
-        self._cv = threading.Condition()  # 스레드 동기화용 Condition 변수
-        self._pending = None              # 검출 대기 중인 최신 프레임
-        self._result = _EMPTY             # 최근 검출 결과
+        self.enable_traffic_light = self.tl_cfg.get("enabled", True)
+        self.tl_class_id = int(self.tl_cfg.get("class_id", 9))
+        self.tl_roi_ratio = float(self.tl_cfg.get("roi_ratio", 0.6))
+        self.tl_conf = float(self.tl_cfg.get("confidence_threshold", 0.10))
+        self.tl_max_aspect = float(self.tl_cfg.get("max_aspect_ratio", 5.0))
+        self.tl_min_sat = int(self.tl_cfg.get("min_saturation", 80))
+        self.tl_min_val = int(self.tl_cfg.get("min_value", 140))
+        self.tl_min_lamp_ratio = float(self.tl_cfg.get("min_lamp_ratio", 0.03))
+
+        # 일반 객체 경로 크기
+        g = imgsz / max(W, crop_h)
+        self.g_size = (max(1, round(W * g)), max(1, round(crop_h * g)))
+        self.g_k = np.array([W / self.g_size[0], crop_h / self.g_size[1]] * 2, np.float32)
+
+        # 신호등 경로 크기
+        self.roi_h = max(1, int(crop_h * self.tl_roi_ratio))
+        t = min(1.0, tl_imgsz / max(W, self.roi_h))
+        self.t_size = (max(1, round(W * t)), max(1, round(self.roi_h * t)))
+        self.t_k = np.array([W / self.t_size[0], self.roi_h / self.t_size[1]] * 2, np.float32)
+        self.model_tl_imgsz = int(np.ceil(max(self.t_size) / 32) * 32)
+
+        # 예열 이미지 (warm_crop 우선, 없으면 warm_img)
+        self._warm = warm_crop if warm_crop is not None else warm_img
+
+        self._cv = threading.Condition()
+        self._pending = None
+        self._result = _EMPTY
         self._stop = False
         self.infer_fps = 0.0
         self.error = None
-        self.ready = threading.Event()    # 예열 완료 여부 신호
+        self.ready = threading.Event()
 
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
-    def submit(self, small_bgr: np.ndarray):
-        # 새로운 프레임을 검출 큐에 전달 (이전 미처리 프레임은 버리고 최신 프레임으로 덮어씀)
+    def submit(self, crop: np.ndarray):
         with self._cv:
-            self._pending = small_bgr
+            self._pending = crop
             self._cv.notify()
 
     def latest(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        # 현재까지의 최신 객체 검출 좌표 결과를 가져옴
         with self._cv:
             return self._result
 
     def stop(self):
-        # 스레드 정지
         with self._cv:
             self._stop = True
             self._cv.notify()
         self._thread.join(timeout=2.0)
 
-    def _enhance(self, img: np.ndarray) -> np.ndarray:
-        return self.enh(img) if self.enh is not None else img
+    def _infer(self, crop: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        # 경로 1: 일반 객체 (축소 + 야간 전처리)
+        small = cv2.resize(crop, self.g_size, interpolation=cv2.INTER_AREA)
+        if self.enh is not None:
+            small = self.enh(small)
 
-    def _infer(self, img: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        # 전처리 + 추론 + 다중 모델 결과 통합
-        img = self._enhance(img)
-        boxes, ids, confs = [], [], []
-        for det in self.dets:
-            xyxy, cls_ids, scores = det.predict(img)
-            if len(cls_ids):
-                boxes.append(xyxy)
-                ids.append(cls_ids)
-                confs.append(scores)
-        if not boxes:
+        all_xyxy, all_ids, all_confs = [], [], []
+        main_det = self.dets[0]
+
+        # 메인 일반 객체 추론 (신호등 분리)
+        g_classes = [c for c in (main_det.classes or TARGET_CLASSES) if c != self.tl_class_id] if self.enable_traffic_light else main_det.classes
+        g_xyxy, g_ids, g_confs = main_det.predict(small, imgsz=self.imgsz, classes=g_classes)
+        if len(g_ids):
+            all_xyxy.append(g_xyxy * self.g_k)
+            all_ids.append(g_ids)
+            all_confs.append(g_confs)
+
+        # 추가 검출기(횡단보도 등)
+        for extra_det in self.dets[1:]:
+            e_xyxy, e_ids, e_confs = extra_det.predict(small, imgsz=self.imgsz)
+            if len(e_ids):
+                all_xyxy.append(e_xyxy * self.g_k)
+                all_ids.append(e_ids)
+                all_confs.append(e_confs)
+
+        # 경로 2: 신호등 전용 경로 (상단 ROI 고해상도 + 램프 색상/형상 검증)
+        if self.enable_traffic_light:
+            roi = cv2.resize(crop[:self.roi_h], self.t_size, interpolation=cv2.INTER_AREA)
+            t_xyxy, t_ids, t_confs = main_det.predict(roi, imgsz=self.model_tl_imgsz, classes=[self.tl_class_id], conf=self.tl_conf)
+            t_xyxy, t_ids, t_confs = verify_traffic_lights(
+                roi, t_xyxy, t_ids, t_confs,
+                max_aspect=self.tl_max_aspect,
+                min_sat=self.tl_min_sat,
+                min_val=self.tl_min_val,
+                min_lamp_ratio=self.tl_min_lamp_ratio,
+            )
+            if len(t_ids):
+                all_xyxy.append(t_xyxy * self.t_k)
+                all_ids.append(t_ids)
+                all_confs.append(t_confs)
+
+        if not all_xyxy:
             return _EMPTY
-        return np.concatenate(boxes), np.concatenate(ids), np.concatenate(confs)
+
+        return np.concatenate(all_xyxy), np.concatenate(all_ids), np.concatenate(all_confs)
+
+    def _warmup(self):
+        if self.dets and self.dets[0].device == "cuda":
+            self.dets[0].precision_kwargs = {"half": True}
+            try:
+                self._infer(self._warm)
+            except Exception:
+                self.dets[0].precision_kwargs = {}
+        res = _EMPTY
+        for _ in range(3):
+            res = self._infer(self._warm)
+        return res
 
     def _run(self):
-        # 검출 백그라운드 스레드 루프
         try:
-            # 1) 첫 프레임을 활용한 모델 Warmup 실행
-            warm = self._enhance(self._warm_img)
-            for det in self.dets:
-                det.warmup(warm)
-
-            # 첫 예열 추론 결과 저장 및 재생 준비 신호(ready) 발송
-            xyxy, cls_ids, scores = self._infer(self._warm_img)
+            res = self._warmup()
             with self._cv:
-                self._result = (xyxy * self.inv_scale, cls_ids, scores)
+                self._result = res
             self.ready.set()
 
-            # 2) 본 추론 루프 (늘 '가장 최신' 프레임만 꺼내 추론)
             while True:
                 with self._cv:
                     while self._pending is None and not self._stop:
@@ -351,26 +466,21 @@ class AsyncDetector:
                     img, self._pending = self._pending, None
 
                 t = time.perf_counter()
-                xyxy, cls_ids, scores = self._infer(img)
+                res = self._infer(img)
                 dt = max(time.perf_counter() - t, 1e-6)
 
-                # 원본 좌표계로 배율 스케일링 후 저장 및 FPS 계산
                 with self._cv:
-                    self._result = (xyxy * self.inv_scale, cls_ids, scores)
-                    self.infer_fps = (
-                        (1.0 / dt) if self.infer_fps == 0 else 0.8 * self.infer_fps + 0.2 / dt
-                    )
+                    self._result = res
+                    self.infer_fps = (1.0 / dt) if self.infer_fps == 0 else 0.8 * self.infer_fps + 0.2 / dt
         except Exception as e:
             self.error = e
             self.ready.set()
 
 
 def draw_boxes(frame: np.ndarray, xyxy: np.ndarray, cls_ids: np.ndarray, scores: np.ndarray):
-    # 영상 프레임 상에 객체 검출 바운딩 박스를 그리는 함수.
-    # (화면을 깔끔하게 유지하기 위해 글씨 라벨 없이 박스 선만 출력)
+    # 영상 프레임 상에 객체 검출 바운딩 박스를 그리는 함수
     for (x1, y1, x2, y2), c, s in zip(xyxy.astype(int), cls_ids, scores):
         label, color = CLASS_META.get(int(c), ("Object", (200, 200, 200)))
-        # 보행자나 횡단보도는 두께 2, 일반 차종은 두께 1로 시각적 차등 부여
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2 if c in (0, CROSSWALK_ID) else 1)
 
 
@@ -378,7 +488,7 @@ def draw_boxes(frame: np.ndarray, xyxy: np.ndarray, cls_ids: np.ndarray, scores:
 # 4. dashcam_cv 파이프라인 통합 클래스
 # ==========================================
 class ObjectDetector:
-    """객체검출.py 기반의 경량/고속 객체 검출기 (OpenCV 폴백 제거, 순수 YOLO 백엔드)."""
+    """objects_detector_th.py 기반의 듀얼 경로(일반 객체 + 신호등 ROI 고해상도 검증) 경량 객체 검출기."""
 
     def __init__(self, cfg: Optional[Dict[str, Any]] = None):
         self.cfg = cfg or {}
@@ -388,16 +498,36 @@ class ObjectDetector:
         self.backend = det_cfg.get("backend", "auto")
         self.model_name = det_cfg.get("model_name", MODEL_WEIGHT)
         self.conf = float(det_cfg.get("confidence_threshold", CONF))
-        self.person_conf = float(det_cfg.get("person_confidence_threshold", CONF))
+        self.person_conf = float(det_cfg.get("person_confidence_threshold", self.conf))
         self.iou = float(det_cfg.get("iou_threshold", IOU))
         self.interval = max(1, int(det_cfg.get("detect_interval", 5)))
-        self.target_classes = list(det_cfg.get("target_classes", TARGET_CLASSES))
+        raw_target_classes = list(det_cfg.get("target_classes", TARGET_CLASSES))
 
         # 야간 최적화 및 크롭 설정
         self.hood_crop_ratio = float(det_cfg.get("hood_crop_ratio", HOOD_CROP_RATIO))
         self.enable_enhance = det_cfg.get("enable_enhance", ENABLE_ENHANCE)
         self.imgsz_gpu = int(det_cfg.get("imgsz_gpu", IMGSZ_GPU))
         self.imgsz_cpu = int(det_cfg.get("imgsz_cpu", IMGSZ_CPU))
+        self.ne_cfg = det_cfg.get("night_enhancer", {})
+
+        # 신호등 전용 듀얼 경로 설정 (objects_detector_th.py 호환)
+        tl_cfg = det_cfg.get("traffic_light", {})
+        self.enable_traffic_light = tl_cfg.get("enabled", True)
+        self.tl_class_id = int(tl_cfg.get("class_id", 9))
+        self.tl_roi_ratio = float(tl_cfg.get("roi_ratio", 0.6))
+        self.tl_imgsz_gpu = int(tl_cfg.get("imgsz_gpu", 1280))
+        self.tl_imgsz_cpu = int(tl_cfg.get("imgsz_cpu", 640))
+        self.tl_conf = float(tl_cfg.get("confidence_threshold", 0.10))
+        self.tl_max_aspect = float(tl_cfg.get("max_aspect_ratio", 5.0))
+        self.tl_min_sat = int(tl_cfg.get("min_saturation", 80))
+        self.tl_min_val = int(tl_cfg.get("min_value", 140))
+        self.tl_min_lamp_ratio = float(tl_cfg.get("min_lamp_ratio", 0.03))
+
+        # 신호등 전용 경로 활성화 시 일반 객체 대상에서 신호등 클래스 분리
+        if self.enable_traffic_light and self.tl_class_id in raw_target_classes:
+            self.general_target_classes = [c for c in raw_target_classes if c != self.tl_class_id]
+        else:
+            self.general_target_classes = raw_target_classes
 
         # 횡단보도 전용 모델 설정
         self.enable_crosswalk = det_cfg.get("enable_crosswalk", ENABLE_CROSSWALK)
@@ -409,33 +539,56 @@ class ObjectDetector:
         self.enhancer: Optional[NightEnhancer] = None
         self.device = "cpu"
         self.imgsz = self.imgsz_cpu
+        self.tl_imgsz = self.tl_imgsz_cpu
         self._warmed_up = False
         self.cached_boxes: List[ObjectBox] = []
 
         self._init_backend()
 
     def _init_backend(self):
-        """디바이스 점검 및 모델 로드 (객체검출.py 방식)."""
+        """디바이스 점검 및 모델 로드."""
         if not self.enabled or self.backend == "none":
             print("[ObjectDetector] Detector disabled.")
             return
 
         self.device = pick_device()
-        self.detectors, self.imgsz = build_detectors(
-            device=self.device,
-            model_weight=self.model_name,
-            conf=min(self.conf, self.person_conf),
-            target_classes=self.target_classes,
-            enable_crosswalk=self.enable_crosswalk,
-            crosswalk_weight=self.crosswalk_weight,
-            crosswalk_class_name=self.crosswalk_class_name,
-            crosswalk_conf=self.crosswalk_conf,
-            imgsz_gpu=self.imgsz_gpu,
-            imgsz_cpu=self.imgsz_cpu,
-        )
+        self.imgsz = self.imgsz_gpu if self.device == "cuda" else self.imgsz_cpu
+        self.tl_imgsz = self.tl_imgsz_gpu if self.device == "cuda" else self.tl_imgsz_cpu
 
+        if self.device == "cuda" and torch is not None:
+            torch.backends.cudnn.benchmark = True
+        elif torch is not None:
+            torch.set_num_threads(os.cpu_count() or 4)
+
+        # 1. 메인 COCO 검출기 (일반 객체 클래스 대상)
+        main_det = Detector(
+            self.model_name,
+            self.device,
+            self.imgsz,
+            self.general_target_classes,
+            min(self.conf, self.person_conf),
+        )
+        self.detectors = [main_det]
+
+        # 2. 횡단보도 모델 (선택)
+        if self.enable_crosswalk:
+            try:
+                cw = Detector(self.crosswalk_weight, self.device, self.imgsz, None, self.crosswalk_conf)
+                cw_ids = [i for i, n in cw.names.items() if str(n).lower() == self.crosswalk_class_name]
+                if cw_ids:
+                    cw.classes = cw_ids
+                    cw.id_map = {i: CROSSWALK_ID for i in cw_ids}
+                    self.detectors.append(cw)
+            except Exception as e:
+                print(f"[경고] 횡단보도 모델 로드 실패({e!r}) -> 일반 검출만 실행합니다.")
+
+        # 3. 야간 전처리기
         if self.enable_enhance:
-            self.enhancer = NightEnhancer()
+            self.enhancer = NightEnhancer(
+                clip_limit=float(self.ne_cfg.get("clip_limit", 2.0)),
+                tile_grid_size=tuple(self.ne_cfg.get("tile_grid_size", [8, 8])),
+                gamma=float(self.ne_cfg.get("gamma", 0.8)),
+            )
 
         self.backend = "ultralytics"
 
@@ -453,38 +606,83 @@ class ObjectDetector:
         return boxes, True
 
     def _detect_yolo(self, frame: np.ndarray) -> List[ObjectBox]:
-        """본네트 제거, 해상도 축소, 야간 보정을 거친 고속 다중 YOLO 추론."""
+        """본네트 제거 + 일반 객체(전처리+축소) & 신호등(상단 고해상도 ROI+램프검증) 듀얼 추론."""
         h, w = frame.shape[:2]
 
-        # 1. 본네트 하단 영역 제외 (오검출 방지 및 연산 절약)
+        # 1. 본네트 하단 영역 제외
         crop_h = int(h * (1.0 - self.hood_crop_ratio))
-        cropped = frame[:crop_h]
+        crop = frame[:crop_h]
 
-        # 2. 추론 해상도로 축소
-        scale = self.imgsz / max(w, crop_h)
-        small_w = max(1, round(w * scale))
-        small_h = max(1, round(crop_h * scale))
-        small = cv2.resize(cropped, (small_w, small_h), interpolation=cv2.INTER_AREA)
+        # 일반 객체 경로 크기 계산
+        g_scale = self.imgsz / max(w, crop_h)
+        g_size = (max(1, round(w * g_scale)), max(1, round(crop_h * g_scale)))
+        g_k = np.array([w / g_size[0], crop_h / g_size[1]] * 2, np.float32)
 
-        # 3. 첫 프레임 예열 (Warmup)
+        # 2. 첫 프레임 예열 (Warmup)
         if not self._warmed_up:
-            warm_img = self.enhancer(small) if self.enhancer is not None else small
+            warm_small = cv2.resize(crop, g_size, interpolation=cv2.INTER_AREA)
+            if self.enhancer is not None:
+                warm_small = self.enhancer(warm_small)
             for det in self.detectors:
-                det.warmup(warm_img)
+                det.warmup(warm_small)
             self._warmed_up = True
 
-        # 4. 야간 전처리
+        # ── 경로 1: 일반 객체 (축소 + 야간 전처리 + YOLO) ──
+        small = cv2.resize(crop, g_size, interpolation=cv2.INTER_AREA)
         if self.enhancer is not None:
             small = self.enhancer(small)
 
-        # 5. 서브 검출기 추론 수행
         all_xyxy, all_ids, all_confs = [], [], []
-        for det in self.detectors:
-            xyxy, cls_ids, confs = det.predict(small)
-            if len(cls_ids):
-                all_xyxy.append(xyxy)
-                all_ids.append(cls_ids)
-                all_confs.append(confs)
+        main_det = self.detectors[0]
+
+        g_xyxy, g_ids, g_confs = main_det.predict(
+            small,
+            imgsz=self.imgsz,
+            classes=self.general_target_classes,
+            conf=min(self.conf, self.person_conf),
+        )
+        if len(g_ids):
+            all_xyxy.append(g_xyxy * g_k)
+            all_ids.append(g_ids)
+            all_confs.append(g_confs)
+
+        # 추가 검출기(횡단보도 등)
+        for extra_det in self.detectors[1:]:
+            e_xyxy, e_ids, e_confs = extra_det.predict(small, imgsz=self.imgsz)
+            if len(e_ids):
+                all_xyxy.append(e_xyxy * g_k)
+                all_ids.append(e_ids)
+                all_confs.append(e_confs)
+
+        # ── 경로 2: 신호등 전용 경로 (상단 ROI 고해상도 + 램프 색/형상 검증) ──
+        if self.enable_traffic_light:
+            roi_h = max(1, int(crop_h * self.tl_roi_ratio))
+            t_scale = min(1.0, self.tl_imgsz / max(w, roi_h))
+            t_size = (max(1, round(w * t_scale)), max(1, round(roi_h * t_scale)))
+            t_k = np.array([w / t_size[0], roi_h / t_size[1]] * 2, np.float32)
+            model_tl_imgsz = int(np.ceil(max(t_size) / 32) * 32)
+
+            roi_small = cv2.resize(crop[:roi_h], t_size, interpolation=cv2.INTER_AREA)
+            t_xyxy, t_ids, t_confs = main_det.predict(
+                roi_small,
+                imgsz=model_tl_imgsz,
+                classes=[self.tl_class_id],
+                conf=self.tl_conf,
+            )
+            t_xyxy, t_ids, t_confs = verify_traffic_lights(
+                roi_small,
+                t_xyxy,
+                t_ids,
+                t_confs,
+                max_aspect=self.tl_max_aspect,
+                min_sat=self.tl_min_sat,
+                min_val=self.tl_min_val,
+                min_lamp_ratio=self.tl_min_lamp_ratio,
+            )
+            if len(t_ids):
+                all_xyxy.append(t_xyxy * t_k)
+                all_ids.append(t_ids)
+                all_confs.append(t_confs)
 
         if not all_xyxy:
             return []
@@ -493,20 +691,22 @@ class ObjectDetector:
         cat_ids = np.concatenate(all_ids)
         cat_confs = np.concatenate(all_confs)
 
-        # 6. 원본 좌표계로 스케일 복원
-        inv_scale = 1.0 / scale
         boxes: List[ObjectBox] = []
-
         for i in range(len(cat_xyxy)):
             cls_id = int(cat_ids[i])
             score = float(cat_confs[i])
 
-            # 보행자 민감도 분기
-            min_score = self.person_conf if cls_id == 0 else self.conf
+            if cls_id == self.tl_class_id and self.enable_traffic_light:
+                min_score = self.tl_conf
+            elif cls_id == 0:
+                min_score = self.person_conf
+            else:
+                min_score = self.conf
+
             if score < min_score:
                 continue
 
-            x1, y1, x2, y2 = cat_xyxy[i] * inv_scale
+            x1, y1, x2, y2 = cat_xyxy[i]
             x1 = max(0, min(w - 1, int(round(x1))))
             y1 = max(0, min(crop_h - 1, int(round(y1))))
             x2 = max(0, min(w - 1, int(round(x2))))
@@ -519,7 +719,7 @@ class ObjectDetector:
             boxes.append(
                 ObjectBox(
                     track_id=-1,
-                    bbox=(x1, y1, x2, y2),
+                    bbox=(int(x1), int(y1), int(x2), int(y2)),
                     class_id=cls_id,
                     label=label,
                     confidence=score,
@@ -590,7 +790,15 @@ def run(input_path: str = INPUT_VIDEO, output_path: str = OUTPUT_VIDEO):
     print("[정보] 모델 예열 중... (끝나면 재생이 시작됩니다)")
 
     # 비동기 검출 스레드 생성 및 예열 시작
-    worker = AsyncDetector(detectors, enhancer, 1.0 / scale, warm_small)
+    worker = AsyncDetector(
+        detectors,
+        enhancer,
+        W,
+        crop_h,
+        imgsz,
+        tl_imgsz=1280 if device == "cuda" else 640,
+        warm_crop=first_frame[:crop_h].copy(),
+    )
     worker.ready.wait()  # 예열 완료까지 메인 스레드 대기
 
     if worker.error is not None:
@@ -636,11 +844,8 @@ def run(input_path: str = INPUT_VIDEO, output_path: str = OUTPUT_VIDEO):
                 break
             idx += 1
 
-            # 1) 검출용 전처리: 본네트 잘라내기 & 모델 입력 크기로 축소
-            small = cv2.resize(frame[:crop_h], (small_w, small_h), interpolation=cv2.INTER_AREA)
-
-            # 2) 검출 스레드로 최신 프레임 전송
-            worker.submit(small)
+            # 검출 스레드로 본네트 잘라낸 프레임 전송 (축소 및 듀얼 경로는 검출 스레드에서 수행)
+            worker.submit(frame[:crop_h].copy())
 
             # 3) 가장 최근 완성된 검출 결과를 가져와 그려주기
             xyxy, cls_ids, scores = worker.latest()

@@ -1,5 +1,19 @@
 # 도로주행 영상 기반 경량 자율주행 비전 분석 시스템 설정 파일 (dashcam_cv)
 
+# ───────────────────────────────────────────────
+# 0. 파이프라인 모듈 ON/OFF 스위치
+#    true  = 해당 모듈 실행
+#    false = 해당 모듈 건너뜀 (더미 결과로 대체)
+# ───────────────────────────────────────────────
+pipeline:
+  use_lane_detection:   true   # 차선 검출 + 칼만 트래킹 (LaneDetector + LaneTracker)
+  use_lane_change:      true   # 차선 변경 감지 (LaneChangeDetector)
+  use_object_detector:  true    # 객체 검출 - objects_detector_th.py (ObjectDetector)
+  use_object_tracker:   true    # 객체 추적 (부드러운 연속 추적 & 박스 허공 날림 방지)
+  use_road_markings:    true    # 횡단보도 / 정지선 검출 (RoadMarkingDetector)
+  use_motion_estimator: true   # 배경 광학흐름 추정 (MotionEstimator)
+  use_decision_fusion:  true   # 주행 상태 판단 (DecisionFusion)
+
 # 1. 동영상 입출력 설정
 video:
   input_path: "data/Test_Video_2.mp4"
@@ -58,22 +72,59 @@ lane_change:
   candidate_frames: 3       # 변경 의심 진입 프레임수
   progress_frames: 7        # 변경 진행 판정 프레임수
 
-# 7. 객체 검출 모델 설정 (경량화 최적화)
+# 7. 객체 검출 모델 설정 (objects_detector_th.py 듀얼 경로 및 야간 최적화 호환)
 detector:
   enabled: true
-  backend: "auto"           # "ultralytics", "opencv_dnn", "none", "auto"
-  model_name: "yolo26n.pt"  # 경량 Nano 모델 (yolov8n.pt, yolo11n.pt)
-  confidence_threshold: 0.35
-  person_confidence_threshold: 0.22 # 횡단보도/도로 위 보행자 검출 전용 낮은 임계값
-  iou_threshold: 0.45
-  detect_interval: 5        # N프레임마다 1회 추론 (중간 프레임은 트래커 보간)
-  target_classes: [0, 1, 2, 3, 5, 7, 9] # person, bicycle, car, motorcycle, bus, truck, traffic light
+  backend: "ultralytics"           # "ultralytics", "opencv_dnn", "none", "auto"
+  model_name: "yolo26n.pt"         # 사용할 YOLO 모델 가중치 (Nano 모델)
+  detect_interval: 5               # N프레임마다 1회 추론 (중간 프레임은 트래커 보간)
 
-# 8. 객체 추적기 설정 (Centroid & IoU 기반 경량 트래커)
+  # 일반 객체(보행자, 자전거, 승용차, 오토바이, 버스, 트럭) 설정
+  confidence_threshold: 0.22        # 일반 객체 신뢰도 임계값 (CONF=0.22)
+  person_confidence_threshold: 0.22 # 보행자 검출 신뢰도 임계값
+  iou_threshold: 0.45              # NMS IoU 임계값
+  target_classes: [0, 1, 2, 3, 5, 7, 9] # 0:person, 1:bicycle, 2:car, 3:motorcycle, 5:bus, 7:truck, 9:traffic light
+
+  # 해상도 및 영상 영역 최적화
+  imgsz_gpu: 640                   # 일반 객체 GPU 입력 해상도
+  imgsz_cpu: 480                   # 일반 객체 CPU 입력 해상도
+  hood_crop_ratio: 0.15            # 하단 본네트 영역 제거 비율 (하단 15% 크롭)
+
+  # 야간 전처리 설정 (신호등 제외 일반 객체 경로에만 적용)
+  enable_enhance: true             # L 채널 감마 + CLAHE 전처리 활성화
+  night_enhancer:
+    gamma: 0.8                     # 감마 보정 계수 (어두운 영역 개선)
+    clip_limit: 2.0                # CLAHE 대비 제한 계수
+    tile_grid_size: [8, 8]         # CLAHE 타일 격자 크기
+
+  # 신호등 전용 경로 (상단 고해상도 ROI + 램프 색/형상 검증)
+  traffic_light:
+    enabled: true                   # 신호등 전용 듀얼 경로 활성화 여부
+    class_id: 9                    # COCO 신호등 클래스 번호
+    roi_ratio: 0.6                 # 본네트 제거 후 화면 상단 탐색 영역 비율 (상위 60%)
+    imgsz_gpu: 1280                # 신호등 탐색 영역 고해상도 입력 (GPU)
+    imgsz_cpu: 640                 # 신호등 탐색 영역 고해상도 입력 (CPU)
+    confidence_threshold: 0.10     # 낮은 신뢰도로 후보 수집 (오검출은 아래 필터로 제거)
+    max_aspect_ratio: 5.0          # 박스 종횡비(긴변/짧은변) 최대 허용 비율 (가로형 건물 조명 제거)
+    min_saturation: 80             # 램프 픽셀 최소 채도 (백색 조명 제외)
+    min_value: 140                 # 램프 픽셀 최소 밝기
+    min_lamp_ratio: 0.03           # 박스 면적 대비 밝은 적/황/녹 램프 픽셀 최소 비율 (3%)
+
+  # 화면 표시 및 바운딩 박스 색상 설정
+  display_max_width: 1280          # 화면 표시 최대 가로 해상도
+  show_fps: true                   # 화면 좌측 상단 FPS 표시 여부
+  colors:
+    object: [0, 255, 255]          # 일반 객체 박스 색상 (BGR: 노란색)
+    traffic_light: [0, 255, 0]     # 신호등 박스 색상 (BGR: 녹색)
+
+# 8. 객체 추적기 설정 (부드러운 EMA 보간 & 이상 속도 억제 트래커)
 tracker:
-  max_distance_px: 85
+  max_distance_px: 90
   max_missed_frames: 10
   lead_vehicle_corridor_margin_px: 130 # 내 주행 차로 내 선행 차량 판별 여유폭
+  ema_alpha: 0.65                       # 신규 검출 반영 비율 (0.65: 떨림 방지 및 부드러운 박스 추종)
+  velocity_decay: 0.88                  # 프레임 간 속도 감쇠율 (미검출 시 허공 날림 방지)
+  max_speed_px: 15.0                    # 1프레임당 최대 이동 허용 속도 (이상치 차단)
 
 # 9. 횡단보도 및 정지선 검출 설정
 road_markings:
@@ -109,6 +160,6 @@ visualization:
   show_lane_polygon: true   # 주행 영역 반투명 채우기
   show_center_path: true    # 주행 중심 경로선 표시
   show_hud_card: true       # 주행 상태 및 지표 대시보드 표시
-  show_debug_minimap: true  # 우측 상단 ROI 에지 미니맵 표시
+  show_debug_minimap: false  # 우측 상단 ROI 에지 미니맵 표시
   show_objects: true        # 객체 검출 바운딩 박스 표시 여부
-  show_object_labels: true  # 객체 검출 바운딩 박스 라벨(태그 텍스트) 표시 여부
+  show_object_labels: false  # 객체 검출 바운딩 박스 라벨(태그 텍스트) 표시 여부

@@ -64,42 +64,95 @@ import numpy as np                 # 배열(박스 좌표 등) 연산
 import torch                       # GPU 사용 가능 여부 확인, 연산 설정
 from ultralytics import YOLO       # YOLO 객체 검출 모델
 
+try:
+    from ..common.data_models import ObjectBox
+except Exception:
+    try:
+        from src.common.data_models import ObjectBox
+    except Exception:
+        ObjectBox = None
+
+COCO_CLASS_NAMES = {
+    0: "person",
+    1: "bicycle",
+    2: "car",
+    3: "motorcycle",
+    5: "bus",
+    7: "truck",
+    9: "traffic light",
+}
+
 cv2.setUseOptimized(True)          # OpenCV 내부 최적화(SIMD 등) 켜기
 
 # ==========================================
-# 설정값
+# 설정값 로딩 (dashcam_cv/config/settings.yaml 연동)
 # ==========================================
-INPUT_VIDEO = "images/Test_Video_2.mp4"   # 입력 영상 파일 경로
+try:
+    import yaml
+except ImportError:
+    yaml = None
 
-MODEL_WEIGHT = "yolo26n.pt"                # 사용할 YOLO 가중치 파일 (n = 가장 가벼운 모델)
-TARGET_CLASSES = [0, 1, 2, 3, 5, 7]   # 보행자, 자전거, 승용차, 오토바이, 버스, 트럭
-TRAFFIC_LIGHT_CLASS = 9               # 신호등은 전용 경로로 별도 검출 (COCO 클래스 번호 9)
 
-IMGSZ_GPU = 640            # 일반 객체 입력 해상도 (GPU)
-IMGSZ_CPU = 480            # 일반 객체 입력 해상도 (CPU)
-HOOD_CROP_RATIO = 0.15     # 하단 본네트 영역 제거 비율 (0.15 = 아래 15% 제거)
-ENABLE_ENHANCE = True      # 일반 객체 검출용 야간 전처리 (신호등 경로에는 적용하지 않음)
-DISPLAY_MAX_WIDTH = 1280   # 화면에 표시할 때의 최대 가로 크기 (큰 영상은 이 크기로 줄여서 표시)
-SHOW_FPS = True            # 화면 좌측 상단에 FPS 표시 여부
+def _load_settings():
+    if yaml is None:
+        return {}
+    candidates = [
+        os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "config", "settings.yaml")),
+        os.path.abspath("config/settings.yaml"),
+        os.path.abspath("dashcam_cv/config/settings.yaml"),
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    return yaml.safe_load(f) or {}
+            except Exception:
+                pass
+    return {}
 
-CONF = 0.22                # 일반 객체 신뢰도 임계값 (이보다 낮은 검출은 버림)
-IOU = 0.45                 # 겹치는 박스를 하나로 합칠 때의 IoU 임계값 (NMS)
+
+_cfg = _load_settings()
+_v_cfg = _cfg.get("video", {})
+_d_cfg = _cfg.get("detector", {})
+_tl_cfg = _d_cfg.get("traffic_light", {})
+_colors = _d_cfg.get("colors", {})
+_ne_cfg = _d_cfg.get("night_enhancer", {})
+
+INPUT_VIDEO = _v_cfg.get("input_path", "images/Test_Video_2.mp4")   # 입력 영상 파일 경로
+MODEL_WEIGHT = _d_cfg.get("model_name", "yolo26n.pt")                # 사용할 YOLO 가중치 파일
+
+TRAFFIC_LIGHT_CLASS = int(_tl_cfg.get("class_id", 9))               # 신호등 전용 경로 (COCO 클래스 9)
+_raw_classes = list(_d_cfg.get("target_classes", [0, 1, 2, 3, 5, 7]))
+TARGET_CLASSES = [c for c in _raw_classes if c != TRAFFIC_LIGHT_CLASS]  # 보행자, 자전거, 승용차, 오토바이, 버스, 트럭
+
+IMGSZ_GPU = int(_d_cfg.get("imgsz_gpu", 640))            # 일반 객체 입력 해상도 (GPU)
+IMGSZ_CPU = int(_d_cfg.get("imgsz_cpu", 480))            # 일반 객체 입력 해상도 (CPU)
+HOOD_CROP_RATIO = float(_d_cfg.get("hood_crop_ratio", 0.15))     # 하단 본네트 영역 제거 비율
+ENABLE_ENHANCE = bool(_d_cfg.get("enable_enhance", True))      # 일반 객체 검출용 야간 전처리
+DISPLAY_MAX_WIDTH = int(_d_cfg.get("display_max_width", 1280))   # 화면에 표시할 때의 최대 가로 크기
+SHOW_FPS = bool(_d_cfg.get("show_fps", True))            # 화면 좌측 상단에 FPS 표시 여부
+
+CONF = float(_d_cfg.get("confidence_threshold", 0.22))   # 일반 객체 신뢰도 임계값
+IOU = float(_d_cfg.get("iou_threshold", 0.45))          # NMS IoU 임계값
 
 # --- 신호등 전용 설정 ---
-TL_ROI_RATIO = 0.6         # 본네트 제거 후 화면 위쪽 몇 %까지를 신호등 탐색 영역으로 볼지
-TL_IMGSZ_GPU = 1280        # 신호등 탐색 영역 입력 해상도 (GPU)
-TL_IMGSZ_CPU = 640         # 신호등 탐색 영역 입력 해상도 (CPU)
-TL_CONF = 0.10             # 낮은 신뢰도로 후보를 넓게 잡고 아래 검증으로 오검출 제거
-TL_MAX_ASPECT = 5.0        # 박스 긴 변/짧은 변 허용 최대 비율 (넓은 건물 조명 제거)
-TL_MIN_SAT = 80            # 램프 픽셀 최소 채도 (흰색/무채색 조명 제외)
-TL_MIN_VAL = 140           # 램프 픽셀 최소 밝기
-TL_MIN_LAMP_RATIO = 0.03   # 박스 면적 중 '밝은 적/황/녹 픽셀'의 최소 비율
+TL_ROI_RATIO = float(_tl_cfg.get("roi_ratio", 0.6))         # 본네트 제거 후 상단 탐색 영역 비율
+TL_IMGSZ_GPU = int(_tl_cfg.get("imgsz_gpu", 1280))        # 신호등 탐색 영역 입력 해상도 (GPU)
+TL_IMGSZ_CPU = int(_tl_cfg.get("imgsz_cpu", 640))         # 신호등 탐색 영역 입력 해상도 (CPU)
+TL_CONF = float(_tl_cfg.get("confidence_threshold", 0.10))  # 낮은 신뢰도로 후보 수집
+TL_MAX_ASPECT = float(_tl_cfg.get("max_aspect_ratio", 5.0)) # 박스 긴 변/짧은 변 허용 최대 비율
+TL_MIN_SAT = int(_tl_cfg.get("min_saturation", 80))        # 램프 픽셀 최소 채도
+TL_MIN_VAL = int(_tl_cfg.get("min_value", 140))           # 램프 픽셀 최소 밝기
+TL_MIN_LAMP_RATIO = float(_tl_cfg.get("min_lamp_ratio", 0.03)) # 램프 픽셀 최소 비율
 
-COLOR_OBJECT = (0, 255, 255)   # 일반 객체 박스 색 (BGR: 노란색)
-COLOR_LIGHT = (0, 255, 0)      # 신호등 박스 색 (BGR: 녹색)
+COLOR_OBJECT = tuple(_colors.get("object", [0, 255, 255]))   # 일반 객체 박스 색 (BGR: 노란색)
+COLOR_LIGHT = tuple(_colors.get("traffic_light", [0, 255, 0])) # 신호등 박스 색 (BGR: 녹색)
+
+NE_CLIP_LIMIT = float(_ne_cfg.get("clip_limit", 2.0))
+NE_GRID_SIZE = tuple(_ne_cfg.get("tile_grid_size", [8, 8]))
+NE_GAMMA = float(_ne_cfg.get("gamma", 0.8))
 
 # 검출 결과가 없을 때 돌려주는 '빈 결과' = (박스 좌표 0개, 클래스 ID 0개)
-# 매번 새로 만들지 않고 이 객체를 재사용한다.
 _EMPTY = (np.empty((0, 4), np.float32), np.empty(0, int))
 
 
@@ -155,7 +208,7 @@ def _print_reinstall_help():
 class NightEnhancer:
     # 어두운 야간 영상을 검출하기 좋게 밝기/대비를 보정한다.
     # BGR -> LAB로 바꿔 '밝기(L)' 채널에만 보정을 적용하므로 색상이 변하지 않는다.
-    def __init__(self, clip_limit=2.0, tile_grid_size=(8, 8), gamma=0.8):
+    def __init__(self, clip_limit=NE_CLIP_LIMIT, tile_grid_size=NE_GRID_SIZE, gamma=NE_GAMMA):
         # CLAHE: 화면을 격자(8x8)로 나눠 지역별로 대비를 높이는 기법 (clip_limit이 클수록 대비 강함)
         self.clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_grid_size)
         # 감마 보정표(LUT): 0~255 각 값이 보정 후 어떤 값이 되는지 미리 계산해 둔다.
@@ -204,9 +257,9 @@ class Detector:
         )[0]   # 입력이 이미지 1장이므로 결과 리스트의 첫 번째 항목만 사용
         b = r.boxes
         if b is None or len(b) == 0:
-            return _EMPTY      # 아무것도 검출되지 않음
-        # GPU 텐서 -> CPU numpy 배열로 바꿔서 (박스 좌표 xyxy, 클래스 번호)를 돌려준다.
-        return b.xyxy.cpu().numpy(), b.cls.cpu().numpy().astype(int)
+            return np.empty((0, 4), np.float32), np.empty(0, int), np.empty(0, np.float32)
+        # GPU 텐서 -> CPU numpy 배열로 바꿔서 (박스 좌표 xyxy, 클래스 번호, 신뢰도)를 돌려준다.
+        return b.xyxy.cpu().numpy(), b.cls.cpu().numpy().astype(int), b.conf.cpu().numpy()
 
 
 class AsyncDetector:
@@ -290,6 +343,8 @@ class AsyncDetector:
             if cv2.countNonZero(lit[y1:y2, x1:x2]) >= max(2, TL_MIN_LAMP_RATIO * w * h):
                 keep.append(i)
         keep = np.array(keep, dtype=int)
+        if len(keep) == 0:
+            return _EMPTY
         return xyxy[keep], ids[keep]   # 통과한 박스만 돌려줌
 
     def _infer(self, crop):
@@ -299,11 +354,11 @@ class AsyncDetector:
         small = cv2.resize(crop, self.g_size, interpolation=cv2.INTER_AREA)   # 축소 (INTER_AREA: 줄일 때 화질이 좋음)
         if self.enh is not None:
             small = self.enh(small)   # 축소한 뒤에 전처리해야 연산량이 적다 (원본 해상도에서 CLAHE를 돌리지 않음)
-        g_xyxy, g_ids = self.det.predict(small, self.imgsz, TARGET_CLASSES, CONF)
+        g_xyxy, g_ids, _ = self.det.predict(small, self.imgsz, TARGET_CLASSES, CONF)
 
         # [파이프라인 ④-B] 신호등: 상단 ROI, 전처리 없이(CLAHE가 주변 조명을 키우는 것을 방지) 고해상도 검출 후 검증
         roi = cv2.resize(crop[: self.roi_h], self.t_size, interpolation=cv2.INTER_AREA)   # 위쪽 ROI만 잘라 축소
-        t_xyxy, t_ids = self.det.predict(roi, self.tl_imgsz, [TRAFFIC_LIGHT_CLASS], TL_CONF)   # 신호등만, 낮은 conf
+        t_xyxy, t_ids, _ = self.det.predict(roi, self.tl_imgsz, [TRAFFIC_LIGHT_CLASS], TL_CONF)   # 신호등만, 낮은 conf
         t_xyxy, t_ids = self._verify_traffic_lights(roi, t_xyxy, t_ids)   # 모양/램프색 검증으로 오검출 제거
 
         # [파이프라인 ⑤] 원본 좌표계로 복원 (ROI는 원점이 같아 오프셋 불필요)하고 두 경로의 결과를 합친다.
@@ -366,6 +421,166 @@ class AsyncDetector:
             self.ready.set()
 
 
+class ObjectDetector:
+    """dashcam_cv main.py 파이프라인에서 직접 호출하는 objects_detector_th 기반 객체 검출기."""
+
+    def __init__(self, cfg=None):
+        self.cfg = cfg or _load_settings()
+        det_cfg = self.cfg.get("detector", {})
+        tl_cfg = det_cfg.get("traffic_light", {})
+        ne_cfg = det_cfg.get("night_enhancer", {})
+
+        self.enabled = det_cfg.get("enabled", True)
+        self.model_weight = det_cfg.get("model_name", MODEL_WEIGHT)
+        self.interval = max(1, int(det_cfg.get("detect_interval", 5)))
+        self.conf = float(det_cfg.get("confidence_threshold", CONF))
+        self.person_conf = float(det_cfg.get("person_confidence_threshold", self.conf))
+        self.iou = float(det_cfg.get("iou_threshold", IOU))
+
+        self.hood_crop_ratio = float(det_cfg.get("hood_crop_ratio", HOOD_CROP_RATIO))
+        self.enable_enhance = bool(det_cfg.get("enable_enhance", ENABLE_ENHANCE))
+        self.imgsz_gpu = int(det_cfg.get("imgsz_gpu", IMGSZ_GPU))
+        self.imgsz_cpu = int(det_cfg.get("imgsz_cpu", IMGSZ_CPU))
+
+        self.tl_class_id = int(tl_cfg.get("class_id", TRAFFIC_LIGHT_CLASS))
+        self.tl_roi_ratio = float(tl_cfg.get("roi_ratio", TL_ROI_RATIO))
+        self.tl_imgsz_gpu = int(tl_cfg.get("imgsz_gpu", TL_IMGSZ_GPU))
+        self.tl_imgsz_cpu = int(tl_cfg.get("imgsz_cpu", TL_IMGSZ_CPU))
+        self.tl_conf = float(tl_cfg.get("confidence_threshold", TL_CONF))
+        self.tl_max_aspect = float(tl_cfg.get("max_aspect_ratio", TL_MAX_ASPECT))
+        self.tl_min_sat = int(tl_cfg.get("min_saturation", TL_MIN_SAT))
+        self.tl_min_val = int(tl_cfg.get("min_value", TL_MIN_VAL))
+        self.tl_min_lamp_ratio = float(tl_cfg.get("min_lamp_ratio", TL_MIN_LAMP_RATIO))
+
+        raw_classes = list(det_cfg.get("target_classes", [0, 1, 2, 3, 5, 7]))
+        self.target_classes = [c for c in raw_classes if c != self.tl_class_id]
+
+        self.device = pick_device()
+        self.imgsz = self.imgsz_gpu if self.device == "cuda" else self.imgsz_cpu
+        self.tl_imgsz = self.tl_imgsz_gpu if self.device == "cuda" else self.tl_imgsz_cpu
+
+        self.detector = Detector(self.model_weight, self.device)
+        self.enhancer = NightEnhancer(
+            clip_limit=float(ne_cfg.get("clip_limit", NE_CLIP_LIMIT)),
+            tile_grid_size=tuple(ne_cfg.get("tile_grid_size", NE_GRID_SIZE)),
+            gamma=float(ne_cfg.get("gamma", NE_GAMMA)),
+        ) if self.enable_enhance else None
+
+        self._warmed_up = False
+        self.cached_boxes = []
+
+    def detect(self, frame: np.ndarray, frame_idx: int):
+        if not self.enabled:
+            return [], False
+
+        should_run = ((frame_idx - 1) % self.interval == 0) or (len(self.cached_boxes) == 0 and frame_idx == 1)
+        if not should_run:
+            return self.cached_boxes, False
+
+        h, w = frame.shape[:2]
+        crop_h = int(h * (1.0 - self.hood_crop_ratio))
+        crop = frame[:crop_h]
+
+        g = self.imgsz / max(w, crop_h)
+        g_size = (max(1, round(w * g)), max(1, round(crop_h * g)))
+        g_k = np.array([w / g_size[0], crop_h / g_size[1]] * 2, np.float32)
+
+        roi_h = max(1, int(crop_h * self.tl_roi_ratio))
+        t = min(1.0, self.tl_imgsz / max(w, roi_h))
+        t_size = (max(1, round(w * t)), max(1, round(roi_h * t)))
+        t_k = np.array([w / t_size[0], roi_h / t_size[1]] * 2, np.float32)
+        tl_model_sz = int(np.ceil(max(t_size) / 32) * 32)
+
+        if not self._warmed_up:
+            if self.device == "cuda":
+                self.detector.half = True
+            for _ in range(3):
+                small_w = cv2.resize(crop, g_size, interpolation=cv2.INTER_AREA)
+                if self.enhancer:
+                    small_w = self.enhancer(small_w)
+                self.detector.predict(small_w, self.imgsz, self.target_classes, self.conf)
+            self._warmed_up = True
+
+        # ── 경로 1: 일반 객체 ──
+        small = cv2.resize(crop, g_size, interpolation=cv2.INTER_AREA)
+        if self.enhancer:
+            small = self.enhancer(small)
+        g_xyxy, g_ids, g_confs = self.detector.predict(small, self.imgsz, self.target_classes, min(self.conf, self.person_conf))
+
+        # ── 경로 2: 신호등 전용 경로 ──
+        roi = cv2.resize(crop[:roi_h], t_size, interpolation=cv2.INTER_AREA)
+        t_xyxy, t_ids, t_confs = self.detector.predict(roi, tl_model_sz, [self.tl_class_id], self.tl_conf)
+        t_xyxy, t_ids, t_confs = self._verify_traffic_lights(
+            roi, t_xyxy, t_ids, t_confs,
+            max_aspect=self.tl_max_aspect,
+            min_sat=self.tl_min_sat,
+            min_val=self.tl_min_val,
+            min_lamp_ratio=self.tl_min_lamp_ratio,
+        )
+
+        all_boxes = []
+        if len(g_ids):
+            for (x1, y1, x2, y2), cid, sc in zip(g_xyxy * g_k, g_ids, g_confs):
+                min_sc = self.person_conf if cid == 0 else self.conf
+                if sc < min_sc:
+                    continue
+                all_boxes.append((int(round(x1)), int(round(y1)), int(round(x2)), int(round(y2)), cid, sc))
+
+        if len(t_ids):
+            for (x1, y1, x2, y2), cid, sc in zip(t_xyxy * t_k, t_ids, t_confs):
+                if sc < self.tl_conf:
+                    continue
+                all_boxes.append((int(round(x1)), int(round(y1)), int(round(x2)), int(round(y2)), cid, sc))
+
+        result_boxes = []
+        for x1, y1, x2, y2, cid, sc in all_boxes:
+            x1 = max(0, min(w - 1, x1))
+            y1 = max(0, min(crop_h - 1, y1))
+            x2 = max(0, min(w - 1, x2))
+            y2 = max(0, min(crop_h - 1, y2))
+            cx = (x1 + x2) / 2.0
+            cy = (y1 + y2) / 2.0
+            label = COCO_CLASS_NAMES.get(int(cid), f"class_{cid}")
+
+            if ObjectBox is not None:
+                result_boxes.append(
+                    ObjectBox(
+                        track_id=-1,
+                        bbox=(int(x1), int(y1), int(x2), int(y2)),
+                        class_id=int(cid),
+                        label=label,
+                        confidence=float(sc),
+                        center=(cx, cy),
+                    )
+                )
+
+        self.cached_boxes = result_boxes
+        return result_boxes, True
+
+    def _verify_traffic_lights(self, roi, xyxy, ids, confs, max_aspect=5.0, min_sat=80, min_val=140, min_lamp_ratio=0.03):
+        if not len(ids):
+            return np.empty((0, 4), np.float32), np.empty(0, int), np.empty(0, np.float32)
+
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        lit = (
+            cv2.inRange(hsv, (0, min_sat, min_val), (12, 255, 255))
+            | cv2.inRange(hsv, (18, min_sat, min_val), (95, 255, 255))
+            | cv2.inRange(hsv, (165, min_sat, min_val), (180, 255, 255))
+        )
+
+        keep = []
+        for i, (x1, y1, x2, y2) in enumerate(xyxy.astype(int)):
+            w, h = x2 - x1, y2 - y1
+            if min(w, h) < 1 or max(w, h) > max_aspect * min(w, h):
+                continue
+            if cv2.countNonZero(lit[y1:y2, x1:x2]) >= max(2, min_lamp_ratio * w * h):
+                keep.append(i)
+        keep = np.array(keep, dtype=int)
+        if len(keep) == 0:
+            return np.empty((0, 4), np.float32), np.empty(0, int), np.empty(0, np.float32)
+        return xyxy[keep], ids[keep], confs[keep]
+
+
 def draw_boxes(frame, xyxy, cls_ids):
     # 프레임 위에 바운딩 박스(네모)만 그린다 (글씨 없음)
     for (x1, y1, x2, y2), c in zip(xyxy.astype(int), cls_ids):
@@ -384,7 +599,19 @@ WINDOW = "Night Drive Detection"   # 영상이 표시되는 창 이름
 
 def run(input_path):
     # ── 시작 단계 ─────────────────────────────────────────
-    # 영상 파일 열기 (없거나 열 수 없으면 안내하고 종료)
+    # 영상 파일 열기 (상대 경로 및 data 폴더 탐색)
+    if not os.path.exists(input_path):
+        for alt in [
+            os.path.join("dashcam_cv", input_path),
+            os.path.join("..", "..", input_path),
+            "data/Test_Video_2.mp4",
+            "dashcam_cv/data/Test_Video_2.mp4",
+            "images/Test_Video_2.mp4",
+        ]:
+            if os.path.exists(alt):
+                input_path = alt
+                break
+
     if not os.path.exists(input_path):
         print(f"[오류] 입력 파일을 찾을 수 없습니다: {input_path}")
         return
