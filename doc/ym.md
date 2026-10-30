@@ -528,3 +528,43 @@ IoU는 Intersection over Union의 약자이며, 두 바운딩 박스가 얼마�
 |`render`|1.19ms|결과를 프레임 위에 그리는 시각화|
 
 평균 총 처리시간 `21.61ms`를 FPS로 환산하면 약 **46.3 FPS**이므로, `effective_processing_fps`와 거의 일치합니다. 모듈별 평균을 더하면 약 **20.53ms**로 총 시간보다 조금 짧은데, 측정 범위에 차이가 있거나 모듈별 시간에 포함되지 않는 오버헤드가 있을 수 있습니다.
+
+
+## 성능 분석 후 개선
+
+#### 분석 결과
+실행 자체에는 문제가 없지만, 반복 프레임마다 불필요한 연산이 있습니다.
+
+|우선순위|위치|문제|권장 수정|
+|---|---|---|---|
+|높음|`main.py`|`roi_corners = get_roi_polygon(...)` 계산 후 사용하지 않음|해당 줄 제거|
+|높음|`main.py`|EM 검출기에서 Canny/CLAHE를 다시 계산하고, 이후 프레임 전체를 `frame[:]`으로 복사|`frame.copy()` 및 전체 프레임 복사 최소화, 검출 결과만 전달|
+|높음|`main.py`|횡단보도 검출기와 차선 모듈이 횡단보도를 중복 검출|차선 모듈이 횡단보도를 담당할 때 일반 횡단보도 검사 건너뛰기|
+|중간|`preprocessing.py`|`FramePreprocessor`와 EM 모듈이 grayscale, CLAHE, Gaussian, Canny를 중복 수행|공통 전처리 결과를 EM에 전달하거나 검출기를 통합|
+|중간|`visualizer.py`|EM 모드에서도 `vis`와 `overlay` 전체 프레임 복사를 매 프레임 수행|`overlay`를 lane/corridor 렌더링이 필요할 때만 생성|
+|중간|`main.py`|`lane_change_detector.update()`를 매 프레임 실행|저렴하지만 차선 모듈·HUD에 변경 정보가 필요 없으면 설정으로 비활성화 가능|
+|낮음|`metrics.py`|모든 `FrameTimings` 객체를 메모리에 저장|장시간 영상에서는 누적 통계로 메모리 사용량 절감 가능|
+
+###$ 장 중요한 중복
+현재 차선 모듈과 road-markings 모듈 모두 횡단보도를 검출할 수 있습니다.
+
+```python
+road_markings.detect(...)
+markings_res.crosswalk_detected = bool(is_crosswalk)
+```
+
+이때 이전 횡단보도 검출 결과는 바로 덮어써지므로, 차선 모듈을 선택했다면 일반 횡단보도 검출기의 _detect_crosswalk()는 불필요한 연산입니다. 정지선 검출만 유지하는 구조로 분리하는 것이 효과적입니다.
+
+전체 프레임 복사
+EM 검출 결과를 현재 main.py에서 다음처럼 복사합니다.
+
+```python
+rendered_frame, status, gray_roi = process_frame(...)
+frame[:] = rendered_frame
+```
+
+EM 내부에서도 이미 frame.copy()와 overlay 복사가 있으므로 중복 비용이 큽니다. 검출 전용 모드에서는 렌더링을 완전히 제거하고 차선 좌표만 반환하는 것이 가장 빠른 구조입니다.
+
+추가 확인 필요 항목
+decision_fusion.py의 신호등 fallback은 YOLO가 차단하지 않았을 때만 실행되는지 재검증해야 합니다. YOLO가 박스를 찾았지만 색 분류에 실패한 경우 fallback이 막히면 과거 요청과 충돌합니다.
+

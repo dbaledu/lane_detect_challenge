@@ -18,7 +18,8 @@ class RoadMarkingDetector:
         self.stopline_min_width_ratio = float(rm_cfg.get("stopline_min_width_ratio", 0.25))
         self.stopline_max_slope = float(rm_cfg.get("stopline_max_slope", 0.20))
 
-    def detect(self, frame: np.ndarray, gray: np.ndarray, edges: np.ndarray) -> RoadMarkingResult:
+    def detect(self, frame: np.ndarray, gray: np.ndarray, edges: np.ndarray,
+               detect_crosswalk: bool = True) -> RoadMarkingResult:
         """Detects crosswalks and stop lines in the road area."""
         if not self.enabled:
             return RoadMarkingResult()
@@ -31,7 +32,10 @@ class RoadMarkingDetector:
         cv2.fillPoly(mask, roi_corners, 255)
         road_gray = cv2.bitwise_and(gray, mask)
 
-        crosswalk_detected, crosswalk_boxes = self._detect_crosswalk(road_gray, w, h)
+        if detect_crosswalk:
+            crosswalk_detected, crosswalk_boxes = self._detect_crosswalk(road_gray, w, h)
+        else:
+            crosswalk_detected, crosswalk_boxes = False, []
         stopline_detected, stopline_boxes, stopline_y = self._detect_stopline(edges, mask, w, h)
 
         return RoadMarkingResult(

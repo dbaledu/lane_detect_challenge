@@ -166,7 +166,7 @@ class DecisionFusion:
         # Phase 2: [Fallback] Lightweight Contour & Housing Validation
         # (Executes only when YOLO detected no traffic lights; no heavy HoughCircles)
         # ====================================================================
-        if not detected_candidates and not tl_boxes:
+        if not detected_candidates:
             y_start = int(h * self.tl_roi_top)
             y_end = int(h * self.tl_roi_bottom)
             x_start = int(w * self.tl_roi_left)

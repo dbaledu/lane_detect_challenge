@@ -58,13 +58,15 @@ class HUDVisualizer:
         """Composes all visual components onto the frame."""
         h, w = frame.shape[:2]
         vis = frame.copy()
-        overlay = frame.copy()
+        overlay = None
 
         roi_corners = get_roi_polygon(w, h, self.cfg.get("roi"))
 
         # 1. Draw Dual ROI Guidelines & Bounding Boxes (cv1021.py) or default ROI
         if self.show_lane_overlay and lane.left_corners is not None and lane.right_corners is not None:
             if not lane.is_crosswalk:
+                if overlay is None:
+                    overlay = vis.copy()
                 if self.show_bbox:
                     if lane.left_bbox is not None:
                         lx1, ly1, lx2, ly2 = lane.left_bbox
@@ -81,6 +83,8 @@ class HUDVisualizer:
                 cv2.polylines(overlay, [lane.left_corners], isClosed=True, color=(255, 200, 0), thickness=1)
                 cv2.polylines(overlay, [lane.right_corners], isClosed=True, color=(0, 200, 255), thickness=1)
         elif self.show_lane_overlay:
+            if overlay is None:
+                overlay = vis.copy()
             cv2.polylines(overlay, [roi_corners], isClosed=True, color=(70, 70, 70), thickness=1)
 
 
@@ -99,10 +103,13 @@ class HUDVisualizer:
             elif state.fusion_state == "STOP_REQUIRED":
                 corridor_color = (40, 40, 220)  # Red
 
+            if overlay is None:
+                overlay = vis.copy()
             cv2.fillPoly(overlay, corridor_pts, corridor_color)
 
-        # Alpha blend corridor overlay
-        vis = cv2.addWeighted(overlay, 0.30, vis, 0.70, 0)
+        # Alpha blend only when corridor/ROI geometry actually created an overlay.
+        if overlay is not None:
+            vis = cv2.addWeighted(overlay, 0.30, vis, 0.70, 0)
 
         # Draw Left/Right Lane lines on top of blend
         if self.show_lane_overlay and lane.left_line:

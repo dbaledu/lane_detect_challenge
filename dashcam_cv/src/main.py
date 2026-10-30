@@ -58,15 +58,17 @@ class LanesDetectorV1EMAdapter:
         self.crosswalk_detector = None
         self.prev_gray_roi = None
 
-    def detect(self, frame: np.ndarray):
+    def detect(self, frame: np.ndarray, gray: np.ndarray = None,
+               enhanced: np.ndarray = None, edges: np.ndarray = None):
         h, w = frame.shape[:2]
         if self.crosswalk_detector is None:
             self.crosswalk_detector = self.module.CrosswalkAndMotionDetector(w, h)
 
-        rendered_frame, status, gray_roi = self.module.process_frame(
-            frame, self.tracker, self.crosswalk_detector, self.clahe, self.prev_gray_roi, calibrator=None
+        _, status, gray_roi = self.module.process_frame(
+            frame, self.tracker, self.crosswalk_detector, self.clahe,
+            self.prev_gray_roi, calibrator=None,
+            gray=gray, enhanced=enhanced, edge_map=edges
         )
-        frame[:] = rendered_frame
         self.prev_gray_roi = gray_roi
 
         y_top = float(h * 0.65)
@@ -108,7 +110,7 @@ def load_lane_detector(cfg: dict):
         return module.HighStabilityLaneTracker(cfg), module, "lane_line"
     if name in ("lanes_detector_v1_em", "lanes_detector_v1_em.py", "lanes_detector_v1_EM", "em"):
         module = load_lane_module("lanes_detector_v1_EM.py", "src.lane.lanes_detector_v1_EM")
-        return LanesDetectorV1EMAdapter(module, cfg), None, "lanes_detector_v1_em"
+        return LanesDetectorV1EMAdapter(module, cfg), module, "lanes_detector_v1_em"
     raise ValueError(f"Unknown lane.detector '{name}'. Use 'lane_line' or 'lanes_detector_v1_em'.")
 
 
@@ -202,7 +204,7 @@ def run_pipeline(cfg: dict, args: argparse.Namespace):
     motion_estimator = MotionEstimator(cfg)
     decision_fusion = DecisionFusion(cfg)
     lane_renderer = lane_module.draw_lane_hud if lane_module is not None else None
-    lane_output_enabled = lane_detector_name != "lanes_detector_v1_em"
+    lane_output_enabled = lane_module is not None
     visualizer = HUDVisualizer(
         cfg,
         lane_renderer=lane_renderer,
@@ -237,14 +239,18 @@ def run_pipeline(cfg: dict, args: argparse.Namespace):
 
             # Preprocessing & Quality
             t0 = time.perf_counter()
-            roi_corners = get_roi_polygon(meta.target_width, meta.target_height, cfg.get("roi"))
             gray, enhanced, edges = preprocessor.process(frame)
             quality = quality_analyzer.analyze(frame, gray)
             t_preprocess = (time.perf_counter() - t0) * 1000.0
 
             # Lane + crosswalk detection and lane tracking
             t0 = time.perf_counter()
-            curr_left_fit, curr_right_fit, is_crosswalk, lane_debug = lane_detector.detect(frame)
+            if lane_detector_name == "lanes_detector_v1_em":
+                curr_left_fit, curr_right_fit, is_crosswalk, lane_debug = lane_detector.detect(
+                    frame, gray=gray, enhanced=enhanced, edges=edges
+                )
+            else:
+                curr_left_fit, curr_right_fit, is_crosswalk, lane_debug = lane_detector.detect(frame)
             lane_res = lane_tracker.update(
                 curr_left_fit=curr_left_fit,
                 curr_right_fit=curr_right_fit,
@@ -259,7 +265,9 @@ def run_pipeline(cfg: dict, args: argparse.Namespace):
 
             # Road Markings (Crosswalks and Stop lines)
             t0 = time.perf_counter()
-            markings_res = road_markings.detect(frame, enhanced, edges)
+            markings_res = road_markings.detect(
+                frame, enhanced, edges, detect_crosswalk=False
+            )
             # Selected lane detector owns crosswalk detection; road-markings owns stop lines.
             lane_cw_boxes = lane_debug.get("cw_boxes", []) if is_crosswalk else []
             markings_res.crosswalk_detected = bool(is_crosswalk)

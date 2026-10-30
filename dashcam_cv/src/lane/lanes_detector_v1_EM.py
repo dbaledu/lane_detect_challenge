@@ -528,7 +528,8 @@ def fit_representative_line(line_candidates, y_bottom, y_top):
     return line_to_points(y_bottom, y_top, (avg_slope, avg_intercept))
 
 
-def process_frame(frame, tracker, crosswalk_detector, clahe, prev_gray_roi=None, calibrator=None):
+def process_frame(frame, tracker, crosswalk_detector, clahe, prev_gray_roi=None, calibrator=None,
+                  gray=None, enhanced=None, edge_map=None):
     """
     단일 프레임 처리 함수
     - [체커보드 캘리브레이션] 렌즈 왜곡 보정(Undistortion) 선적용
@@ -552,18 +553,19 @@ def process_frame(frame, tracker, crosswalk_detector, clahe, prev_gray_roi=None,
     y_bottom = int(h * 0.88)
     roi_h = y_bottom - y_top
 
-    # 1. 흑백 변환
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-    # 2. [수정점 3] ROI 세로 슬라이스에만 CLAHE 및 Canny 집중 적용 (상단 65% 배제)
+    # 메인 파이프라인에서 이미 계산한 gray/edge를 재사용한다.
+    if gray is None:
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     gray_roi = gray[y_top:y_bottom, :]
 
-    # ROI 전용 CLAHE
-    clahe_roi = clahe.apply(gray_roi)
-
-    # ROI 전용 Canny 윤곽선 검출
-    blurred_roi = cv2.GaussianBlur(clahe_roi, (5, 5), 1.2)
-    canny_roi = cv2.Canny(blurred_roi, threshold1=45, threshold2=135)
+    if edge_map is None:
+        # 단독 실행용 CLAHE/Canny 경로
+        clahe_source = enhanced[y_top:y_bottom, :] if enhanced is not None else gray_roi
+        clahe_roi = clahe.apply(clahe_source)
+        blurred_roi = cv2.GaussianBlur(clahe_roi, (5, 5), 1.2)
+        canny_roi = cv2.Canny(blurred_roi, threshold1=45, threshold2=135)
+    else:
+        canny_roi = edge_map[y_top:y_bottom, :]
 
     # 3. [수정점 2] 사용자 지정 사다리꼴 ROI 마스크 생성 (ROI 로컬 좌표계)
     roi_mask = np.zeros((roi_h, w), dtype=np.uint8)
@@ -642,47 +644,76 @@ def process_frame(frame, tracker, crosswalk_detector, clahe, prev_gray_roi=None,
         is_paused=(not display_lanes)
     )
 
-    # 10. [수정점 1 & 2] 고시인성 차선 렌더링 + 꼬임 방지 가드 (HUD 미출력)
+    # 검출 전용 모드: 차선 오버레이는 visualizer.draw_lane_hud 또는 단독 실행 루프에서 수행한다.
+    return frame, status, gray_roi
+
+
+def draw_lane_hud(
+    frame, left_fit, right_fit, is_crosswalk, debug_info,
+    fps=0.0, show_roi_boxes=True
+):
+    """EM 차선 검출 결과를 공통 visualizer에서 렌더링한다."""
+    if is_crosswalk:
+        return frame.copy()
+
+    h, w = frame.shape[:2]
+    top_y = int(h * 0.65)
+    bot_y = int(h * 0.88)
+
+    def fit_x(fit, y):
+        if fit is None:
+            return None
+        if len(fit) == 3:
+            return int(round(fit[0] * y * y + fit[1] * y + fit[2]))
+        return int(round(fit[0] * y + fit[1]))
+
+    left_top = fit_x(left_fit, top_y)
+    left_bot = fit_x(left_fit, bot_y)
+    right_top = fit_x(right_fit, top_y)
+    right_bot = fit_x(right_fit, bot_y)
+
+    if left_top is None and right_top is None:
+        return frame.copy()
+
     result = frame.copy()
 
-    if display_lanes and smooth_left is not None and smooth_right is not None:
-        lx1, ly1, lx2, ly2 = smooth_left
-        rx1, ry1, rx2, ry2 = smooth_right
-
-        # [수정점 2 핵심: 렌더링 직전 꼬임 방지 안전 마진 강제 적용 (Anti-Twisting Guard)]
+    if left_top is not None and right_top is not None:
+        # Anti-Twisting Guard: 차선이 서로 뒤틀리지 않도록 최소 간격 유지
         min_gap_top = 26
-        if rx2 - lx2 < min_gap_top:
-            center_top = (lx2 + rx2) / 2
-            lx2 = int(center_top - min_gap_top / 2)
-            rx2 = int(center_top + min_gap_top / 2)
+        if right_top - left_top < min_gap_top:
+            center_top = (left_top + right_top) / 2
+            left_top = int(center_top - min_gap_top / 2)
+            right_top = int(center_top + min_gap_top / 2)
 
         min_gap_bottom = 160
-        if rx1 - lx1 < min_gap_bottom:
-            center_bot = (lx1 + rx1) / 2
-            lx1 = int(center_bot - min_gap_bottom / 2)
-            rx1 = int(center_bot + min_gap_bottom / 2)
+        if right_bot - left_bot < min_gap_bottom:
+            center_bot = (left_bot + right_bot) / 2
+            left_bot = int(center_bot - min_gap_bottom / 2)
+            right_bot = int(center_bot + min_gap_bottom / 2)
 
-        overlay = frame.copy()
-
-        # (1) 고시인성 네온 에메랄드 주행 차로 폴리곤
-        lane_poly = np.array([[lx1, ly1], [lx2, ly2], [rx2, ry2], [rx1, ry1]], np.int32)
+        lane_poly = np.array([
+            [left_bot, bot_y], [left_top, top_y],
+            [right_top, top_y], [right_bot, bot_y]
+        ], np.int32)
+        overlay = result.copy()
         cv2.fillPoly(overlay, [lane_poly], (50, 255, 120))
-        result = cv2.addWeighted(overlay, 0.45, frame, 0.55, 0)
+        result = cv2.addWeighted(overlay, 0.45, result, 0.55, 0)
 
-        # (2) 좌측 차선: 일렉트릭 시안(8px 외곽선) + 화이트 코어(3px 발광)
-        cv2.line(result, (lx1, ly1), (lx2, ly2), (255, 210, 0), 8)
-        cv2.line(result, (lx1, ly1), (lx2, ly2), (255, 255, 255), 3)
+    if left_top is not None and left_bot is not None:
+        cv2.line(result, (left_bot, bot_y), (left_top, top_y), (255, 210, 0), 8, cv2.LINE_AA)
+        cv2.line(result, (left_bot, bot_y), (left_top, top_y), (255, 255, 255), 3, cv2.LINE_AA)
 
-        # (3) 우측 차선: 네온 코랄/레드(8px 외곽선) + 화이트 코어(3px 발광)
-        cv2.line(result, (rx1, ry1), (rx2, ry2), (30, 70, 255), 8)
-        cv2.line(result, (rx1, ry1), (rx2, ry2), (255, 255, 255), 3)
+    if right_top is not None and right_bot is not None:
+        cv2.line(result, (right_bot, bot_y), (right_top, top_y), (30, 70, 255), 8, cv2.LINE_AA)
+        cv2.line(result, (right_bot, bot_y), (right_top, top_y), (255, 255, 255), 3, cv2.LINE_AA)
 
-        # (4) 차로 중앙 유도 궤적 점선
-        cx1, cy1 = int((lx1 + rx1) / 2), ly1
-        cx2, cy2 = int((lx2 + rx2) / 2), ly2
-        draw_dashed_line(result, (cx1, cy1), (cx2, cy2), color=(255, 255, 220), thickness=3, dash_length=14)
+    if left_top is not None and right_top is not None:
+        cx_top = int((left_top + right_top) / 2)
+        cx_bot = int((left_bot + right_bot) / 2)
+        draw_dashed_line(result, (cx_bot, bot_y), (cx_top, top_y),
+                         color=(255, 255, 220), thickness=3, dash_length=14)
 
-    return result, status, gray_roi
+    return result
 
 
 def draw_dashed_line(img, pt1, pt2, color=(255, 255, 255), thickness=2, dash_length=12):
@@ -799,6 +830,27 @@ def run_video_pipeline(
                 calibrator=calibrator if use_undistort else None
             )
             prev_gray_roi = cur_gray_roi
+
+            left_line = getattr(tracker, "left_line", None)
+            right_line = getattr(tracker, "right_line", None)
+
+            def line_to_fit(line):
+                if line is None:
+                    return None
+                x_bottom, y_bottom_line, x_top, y_top_line = line.tolist() if hasattr(line, "tolist") else line
+                dy = y_top_line - y_bottom_line
+                if abs(dy) < 1e-4:
+                    return None
+                m = (x_top - x_bottom) / dy
+                return [float(m), float(x_top - m * y_top_line)]
+
+            res_frame = draw_lane_hud(
+                res_frame,
+                line_to_fit(left_line),
+                line_to_fit(right_line),
+                bool(crosswalk_detector.is_crosswalk),
+                {},
+            )
 
             writer.write(res_frame)
 
