@@ -129,7 +129,8 @@ def load_lane_detector(cfg: dict):
     name = str(lane_cfg.get("detector", "lane_line")).strip().lower()
     if name in ("lane_line", "lane-line", "lane line.py"):
         module = load_lane_module("lane line.py", "src.lane.lane_line")
-        return module.HighStabilityLaneTracker(cfg), module, "lane_line"
+        tracker_cls = getattr(module, "AdaptiveHighStabilityLaneTracker", None) or getattr(module, "HighStabilityLaneTracker", None)
+        return tracker_cls(cfg), module, "lane_line"
     if name in ("lanes_detector_v1_em", "lanes_detector_v1_em.py", "lanes_detector_v1_EM", "em"):
         module = load_lane_module("lanes_detector_v1_EM.py", "src.lane.lanes_detector_v1_EM")
         return LanesDetectorV1EMAdapter(module, cfg), None, "lanes_detector_v1_em"
@@ -231,7 +232,7 @@ def run_pipeline(cfg: dict, args: argparse.Namespace):
     road_markings = RoadMarkingDetector(cfg)
     motion_estimator = MotionEstimator(cfg)
     decision_fusion = DecisionFusion(cfg)
-    lane_renderer = lane_module.draw_lane_hud if lane_module is not None else None
+    lane_renderer = (getattr(lane_module, "draw_lane_hud_v2", None) or getattr(lane_module, "draw_lane_hud", None)) if lane_module is not None else None
     lane_output_enabled = lane_detector_name != "lanes_detector_v1_em"
     visualizer = HUDVisualizer(
         cfg,

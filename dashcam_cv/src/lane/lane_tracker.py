@@ -69,7 +69,14 @@ class SingleLaneKalmanFilter:
         pred_c = float(pred[1, 0])
 
         if measurement_fit is not None:
-            m_meas, c_meas = float(measurement_fit[0]), float(measurement_fit[1])
+            if len(measurement_fit) >= 3:
+                y1, y2 = 350.0, 480.0
+                x1 = measurement_fit[0] * (y1 ** 2) + measurement_fit[1] * y1 + measurement_fit[2]
+                x2 = measurement_fit[0] * (y2 ** 2) + measurement_fit[1] * y2 + measurement_fit[2]
+                m_meas = (x2 - x1) / (y2 - y1)
+                c_meas = x1 - m_meas * y1
+            else:
+                m_meas, c_meas = float(measurement_fit[0]), float(measurement_fit[1])
 
             if not self.is_initialized:
                 # 첫 측정값으로 상태 벡터 초기화

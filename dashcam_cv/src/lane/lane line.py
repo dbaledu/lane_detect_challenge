@@ -822,6 +822,11 @@ def draw_lane_hud_v2(
 
 
 # ── 8. 비디오 파이프라인 러너 ─────────────────────────────────────────────────
+# 하위 호환성 별칭 (Backward compatibility aliases)
+HighStabilityLaneTracker = AdaptiveHighStabilityLaneTracker
+draw_lane_hud = draw_lane_hud_v2
+
+
 def run_video_pipeline(
     video_path: str,
     output_path: Optional[str] = None,
