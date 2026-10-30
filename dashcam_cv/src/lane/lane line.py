@@ -1,117 +1,339 @@
 #!/usr/bin/env python3
-"""run_antigravity.py
+"""dashcam_cv.py
 
-고안정성 자율주행 차선 및 횡단보도 추적기 (High-Stability Lane & Crosswalk Tracker)
+도로주행 영상 기반 경량 자율주행 비전 분석 시스템 (dashcam_cv)
 =============================================================================
-[해결된 5대 핵심 문제]
-1. (m, c) 파라미터 시소 현상 완전 제거 -> 화면 좌표계(x_top, x_bottom) 직접 스무딩
-2. 이상치 급격한 점프 방지 -> Slew-rate(최대 이동 속도) 클램핑 적용
-3. 점선(Dashed) 구간 깜빡임 방지 -> 지수 감쇠 메모리 홀드(Graceful Decay Hold)
-4. 곡선 구간 ROI 클리핑 방지 -> 차선 위치 기반 동적 마진(Adaptive ROI Padding)
-5. 화면 바닥(100%) 무리한 외삽 널뛰기 방지 -> 유효 노면 영역(0.67h ~ 0.88h) 정밀 렌더링
-6. 횡단보도 감지 시 즉각적인 차선/ROI 억제 및 안전 정지 배너 표출
+설정 파일(settings.yaml)의 11개 섹션 규격을 100% 준수하며,
+곡선 도로 적응형 2차 다항식 피팅, HLS 그림자 억제, 횡단보도 오탐 방지,
+차선 변경 감지, 광학 흐름 주행 상태 머신이 완전 통합된 고성능 비전 파이프라인.
 """
 
 import os
 import sys
 import time
+import json
+import csv
 import argparse
+from typing import Tuple, Optional, List, Dict, Any
 import cv2
 import numpy as np
-from typing import Tuple, Optional, List, Dict, Any
 
-
-# ── 안전 기하 연산 함수 ────────────────────────────────────────────────────────
+# YAML 파서 안전 로드
 try:
-    from ..common.geometry import compute_slope, evaluate_poly_x
-except Exception:
-    def compute_slope(x1: float, y1: float, x2: float, y2: float) -> Optional[float]:
-        if abs(x2 - x1) < 1e-6:
-            return None
-        return (y2 - y1) / (x2 - x1)
+    import yaml
+except ImportError:
+    yaml = None
 
-    def evaluate_poly_x(fit: List[float], y: float) -> float:
-        if fit is None or len(fit) < 2:
-            return 0.0
-        if len(fit) == 2:
-            return fit[0] * y + fit[1]
-        elif len(fit) == 3:
-            return fit[0] * (y ** 2) + fit[1] * y + fit[2]
+
+# ── 1. 기본 설정 딕셔너리 (settings.yaml 포맷 기본값) ─────────────────────────
+DEFAULT_SETTINGS: Dict[str, Any] = {
+    "video": {
+        "input_path": "data/Test_Video_2.mp4",
+        "output_video": "outputs/annotated_video.mp4",
+        "output_frame_log": "outputs/frame_log.csv",
+        "output_perf_log": "outputs/performance.csv",
+        "output_summary": "outputs/summary.json",
+        "target_width": 960,
+        "frame_stride": 1,
+        "max_frames": 0,
+        "codec": "mp4v"
+    },
+    "quality": {
+        "brightness_night_threshold": 70.0,
+        "blur_laplacian_threshold": 45.0
+    },
+    "preprocessing": {
+        "use_clahe": True,
+        "clahe_clip_limit": 2.5,
+        "clahe_grid_size": [8, 8],
+        "gaussian_kernel": [5, 5],
+        "auto_canny": True,
+        "auto_canny_sigma": 0.33,
+        "canny_low": 60,
+        "canny_high": 150,
+        "morph_close": True
+    },
+    "roi": {
+        "top_ratio": 0.67,
+        "bottom_ratio": 0.86,
+        "bbox_scale_x": 0.72,
+        "top_left_ratio": 0.40,
+        "top_right_ratio": 0.60,
+        "bottom_left_ratio": 0.28,
+        "bottom_right_ratio": 0.72
+    },
+    "lane": {
+        "detector": "lane_line",
+        "undistort": False,
+        "calib_file": "config/camera_calib.npz",
+        "undistort_fov_deg": 115,
+        "hough_threshold": 25,
+        "min_line_length": 20,
+        "max_line_gap": 60,
+        "min_slope": 0.40,
+        "max_slope": 3.0,
+        "max_lost_frames": 30,
+        "default_lane_width_ratio": 0.45,
+        "min_confidence": 0.25,
+        "roi_target_size": [320, 360]
+    },
+    "lane_change": {
+        "drift_threshold_px": 60.0,
+        "candidate_frames": 5,
+        "progress_frames": 10
+    },
+    "detector": {
+        "enabled": False,
+        "backend": "auto",
+        "model_name": "yolo26n.pt",
+        "confidence_threshold": 0.35,
+        "person_confidence_threshold": 0.22,
+        "iou_threshold": 0.45,
+        "detect_interval": 5,
+        "target_classes": [0, 1, 2, 3, 5, 7, 9]
+    },
+    "tracker": {
+        "max_distance_px": 85,
+        "max_missed_frames": 10,
+        "lead_vehicle_corridor_margin_px": 130
+    },
+    "road_markings": {
+        "enable": True,
+        "crosswalk_min_stripes": 3,
+        "stopline_min_width_ratio": 0.25,
+        "stopline_max_slope": 0.20
+    },
+    "state": {
+        "flow_max_features": 150,
+        "flow_stopped_threshold": 0.85,
+        "flow_decel_slope": -0.04,
+        "flow_start_threshold": 1.25,
+        "window_size_frames": 25,
+        "stopped_persistence_frames": 15,
+        "state_hold_frames": 12,
+        "state_debounce_frames": 2,
+        "traffic_light": {
+            "roi_top": 0.10,
+            "roi_bottom": 0.50,
+            "roi_left": 0.15,
+            "roi_right": 0.85,
+            "min_saturation": 120,
+            "min_value": 180,
+            "debounce_frames": 2
+        }
+    },
+    "visualization": {
+        "display_window": False,
+        "show_lane_polygon": True,
+        "show_center_path": True,
+        "show_hud_card": True,
+        "show_debug_minimap": True,
+        "show_objects": False,
+        "show_object_labels": False
+    }
+}
+
+
+def load_settings(yaml_path: str) -> Dict[str, Any]:
+    """YAML 설정 파일을 로드하여 기본값과 병합."""
+    settings = dict(DEFAULT_SETTINGS)
+    if os.path.exists(yaml_path):
+        try:
+            if yaml is not None:
+                with open(yaml_path, "r", encoding="utf-8") as f:
+                    user_cfg = yaml.safe_load(f)
+                    if isinstance(user_cfg, dict):
+                        for k, v in user_cfg.items():
+                            if isinstance(v, dict) and k in settings:
+                                settings[k].update(v)
+                            else:
+                                settings[k] = v
+                print(f"[*] 설정 파일 로드 완료: {yaml_path}")
+            else:
+                print(f"[!] PyYAML 미설치로 기본 설정을 사용합니다.")
+        except Exception as e:
+            print(f"[!] 설정 로드 중 오류: {e}, 기본 설정 유지.")
+    else:
+        print(f"[!] 설정 파일을 찾을 수 없어 기본 설정을 적용합니다: {yaml_path}")
+    return settings
+
+
+# ── 2. 기하 연산 및 다항식 함수 ───────────────────────────────────────────────
+def evaluate_poly_x(fit: Optional[List[float]], y: float) -> float:
+    """1차(직선) 또는 2차(곡선) 다항식에서 y에 대한 x 좌표를 계산."""
+    if fit is None or len(fit) < 2:
         return 0.0
+    if len(fit) == 2:  # x = m*y + c
+        return float(fit[0] * y + fit[1])
+    elif len(fit) >= 3:  # x = a*y² + b*y + c
+        return float(fit[0] * (y ** 2) + fit[1] * y + fit[2])
+    return 0.0
 
 
-# ── 듀얼 ROI 및 마스킹 기하학 ──────────────────────────────────────────────────
-def get_dual_roi_geometry(
-    h: int,
-    w: int,
-    top_ratio: float = 0.67,
-    bot_ratio: float = 0.88,
-    padding_x: int = 24,
-    prev_left_pts: Optional[Tuple[float, float]] = None,
-    prev_right_pts: Optional[Tuple[float, float]] = None,
-) -> Tuple[Tuple[np.ndarray, Tuple[int, int, int, int]], Tuple[np.ndarray, Tuple[int, int, int, int]]]:
-    """곡선 및 차선 이탈에도 잘리지 않도록 동적 마진(Adaptive Margin)을 포함한 듀얼 ROI 산출."""
-    top_y = int(h * top_ratio)
-    bot_y = int(h * bot_ratio)
+# ── 3. 영상 품질 분석 모듈 (Quality Analyzer) ─────────────────────────────────
+class QualityAnalyzer:
+    """프레임 밝기(야간 판정) 및 라플라시안 분산(블러/흔들림 판정)."""
 
-    # 1. 좌측 차선 슬림 사다리꼴 (이전 추적 위치가 있으면 동적 추종, 없으면 기본 기하학)
-    if prev_left_pts is not None:
-        px_top, px_bot = prev_left_pts
-        l_tl_x = max(0, int(px_top - padding_x * 1.5))
-        l_tr_x = min(w // 2, int(px_top + padding_x * 1.5))
-        l_bl_x = max(0, int(px_bot - padding_x * 2.0))
-        l_br_x = min(w // 2 + 50, int(px_bot + padding_x * 1.5))
-    else:
-        l_tl_x = int(w * 0.36)
-        l_tr_x = int(w * 0.47)
-        l_br_x = int(w * 0.42)
-        l_bl_x = int(w * 0.24)
+    def __init__(self, cfg: Dict[str, Any]):
+        self.night_thresh = float(cfg.get("brightness_night_threshold", 70.0))
+        self.blur_thresh = float(cfg.get("blur_laplacian_threshold", 45.0))
 
-    left_tl = (l_tl_x, top_y)
-    left_tr = (l_tr_x, top_y)
-    left_br = (l_br_x, bot_y)
-    left_bl = (l_bl_x, bot_y)
-    left_corners = np.array([[left_tl, left_tr, left_br, left_bl]], dtype=np.int32)
+    def analyze(self, frame: np.ndarray) -> Dict[str, Any]:
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        brightness = float(np.mean(gray))
+        laplacian_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
-    l_xs = [left_tl[0], left_tr[0], left_br[0], left_bl[0]]
-    left_xmin = max(0, min(l_xs) - 6)
-    left_xmax = min(w, max(l_xs) + 6)
-    left_bbox = (left_xmin, top_y, left_xmax, bot_y)
+        is_night = brightness < self.night_thresh
+        is_blurry = laplacian_var < self.blur_thresh
 
-    # 2. 우측 차선 슬림 사다리꼴
-    if prev_right_pts is not None:
-        px_top, px_bot = prev_right_pts
-        r_tl_x = max(w // 2 - 50, int(px_top - padding_x * 1.5))
-        r_tr_x = min(w, int(px_top + padding_x * 1.5))
-        r_bl_x = max(w // 2, int(px_bot - padding_x * 1.5))
-        r_br_x = min(w, int(px_bot + padding_x * 2.0))
-    else:
-        r_tl_x = int(w * 0.53)
-        r_tr_x = int(w * 0.64)
-        r_br_x = int(w * 0.76)
-        r_bl_x = int(w * 0.58)
-
-    right_tl = (r_tl_x, top_y)
-    right_tr = (r_tr_x, top_y)
-    right_br = (r_br_x, bot_y)
-    right_bl = (r_bl_x, bot_y)
-    right_corners = np.array([[right_tl, right_tr, right_br, right_bl]], dtype=np.int32)
-
-    r_xs = [right_tl[0], right_tr[0], right_br[0], right_bl[0]]
-    right_xmin = max(0, min(r_xs) - 6)
-    right_xmax = min(w, max(r_xs) + 6)
-    right_bbox = (right_xmin, top_y, right_xmax, bot_y)
-
-    return (left_corners, left_bbox), (right_corners, right_bbox)
+        return {
+            "brightness": brightness,
+            "laplacian_var": laplacian_var,
+            "is_night": is_night,
+            "is_blurry": is_blurry
+        }
 
 
-def crop_and_resize_roi(
+# ── 4. 전처리 모듈 (Preprocessing: HLS + Auto-Canny + CLAHE) ──────────────────
+class ImagePreprocessor:
+    """설정 기반 적응형 Canny, CLAHE, 모폴로지 닫힘 및 HLS 그림자 배제 에지 추출."""
+
+    def __init__(self, cfg: Dict[str, Any]):
+        self.use_clahe = cfg.get("use_clahe", True)
+        clip = float(cfg.get("clahe_clip_limit", 2.5))
+        grid = tuple(cfg.get("clahe_grid_size", [8, 8]))
+        self.clahe = cv2.createCLAHE(clipLimit=clip, tileGridSize=grid) if self.use_clahe else None
+
+        k = cfg.get("gaussian_kernel", [5, 5])
+        self.gauss_k = (int(k[0]), int(k[1]))
+        self.auto_canny = cfg.get("auto_canny", True)
+        self.auto_canny_sigma = float(cfg.get("auto_canny_sigma", 0.33))
+        self.canny_low = int(cfg.get("canny_low", 60))
+        self.canny_high = int(cfg.get("canny_high", 150))
+        self.morph_close = cfg.get("morph_close", True)
+        self.close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+
+    def process_roi(self, roi_bgr: np.ndarray, is_night: bool = False) -> np.ndarray:
+        if roi_bgr is None or roi_bgr.size == 0:
+            return np.zeros((10, 10), dtype=np.uint8)
+
+        # 1. HLS 채널 분리 (황색선 및 그림자 억제)
+        hls = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2HLS)
+        l_channel = hls[:, :, 1]
+
+        # 황색 차선 마스크 (야간에는 채도 기준 완화)
+        s_min = 55 if is_night else 75
+        yellow_mask = cv2.inRange(hls, np.array([14, 45, s_min]), np.array([38, 255, 255]))
+        # 흰색 차선 마스크
+        l_min = 160 if is_night else 178
+        white_mask = cv2.inRange(l_channel, l_min, 255)
+        color_mask = cv2.bitwise_or(yellow_mask, white_mask)
+
+        # 2. CLAHE 조명 보정
+        if self.clahe is not None:
+            enhanced_l = self.clahe.apply(l_channel)
+        else:
+            enhanced_l = l_channel
+
+        blurred = cv2.GaussianBlur(enhanced_l, self.gauss_k, 0)
+
+        # 3. Auto-Canny (중앙값 기반 동적 임계값)
+        if self.auto_canny:
+            v = np.median(blurred)
+            lower = int(max(0, (1.0 - self.auto_canny_sigma) * v))
+            upper = int(min(255, (1.0 + self.auto_canny_sigma) * v))
+            canny_edges = cv2.Canny(blurred, max(25, lower), min(250, upper))
+        else:
+            canny_edges = cv2.Canny(blurred, self.canny_low, self.canny_high)
+
+        # 4. 그림자 에지 필터링: 색상 마스크 영역과 에지의 교집합
+        dilated_mask = cv2.dilate(color_mask, self.close_kernel, iterations=1)
+        filtered_edges = cv2.bitwise_and(canny_edges, canny_edges, mask=dilated_mask)
+
+        # 차선이 낡아 색상 검출이 낮을 경우 일반 Canny로 자동 폴백
+        if np.count_nonzero(filtered_edges) < 20:
+            final_edges = canny_edges
+        else:
+            final_edges = filtered_edges
+
+        # 5. 점선 차선 연결을 위한 닫힘(Closing) 연산
+        if self.morph_close:
+            final_edges = cv2.morphologyEx(final_edges, cv2.MORPH_CLOSE, self.close_kernel)
+
+        return final_edges
+
+
+# ── 5. 동적 관심영역 (ROI & Wide Fallback) 관리자 ─────────────────────────────
+class ROIManager:
+    """설정 파일 사다리꼴 비율을 따르며, 차선 이탈/곡선 시 Wide-Fallback을 지원."""
+
+    def __init__(self, roi_cfg: Dict[str, Any]):
+        self.top_ratio = float(roi_cfg.get("top_ratio", 0.67))
+        self.bot_ratio = float(roi_cfg.get("bottom_ratio", 0.86))
+        self.tl_r = float(roi_cfg.get("top_left_ratio", 0.40))
+        self.tr_r = float(roi_cfg.get("top_right_ratio", 0.60))
+        self.bl_r = float(roi_cfg.get("bottom_left_ratio", 0.28))
+        self.br_r = float(roi_cfg.get("bottom_right_ratio", 0.72))
+        self.bbox_scale_x = float(roi_cfg.get("bbox_scale_x", 0.72))
+
+    def get_dual_rois(
+        self,
+        h: int,
+        w: int,
+        prev_left: Optional[Tuple[float, float, float]] = None,
+        prev_right: Optional[Tuple[float, float, float]] = None,
+        is_left_lost: bool = False,
+        is_right_lost: bool = False
+    ) -> Tuple[Tuple[np.ndarray, Tuple[int, int, int, int]], Tuple[np.ndarray, Tuple[int, int, int, int]]]:
+        top_y = int(h * self.top_ratio)
+        bot_y = int(h * self.bot_ratio)
+
+        # [좌측 차선 ROI]
+        if prev_left is not None and not is_left_lost:
+            px_t, _, px_b = prev_left
+            margin = int(48 * (w / 960.0))
+            l_tl_x = max(0, int(px_t - margin * 1.5))
+            l_tr_x = min(w - 20, int(px_t + margin * 1.5))
+            l_bl_x = max(0, int(px_b - margin * 2.0))
+            l_br_x = min(w - 10, int(px_b + margin * 1.8))
+        else:
+            # 설정 파일 비율 기반 초기/폴백 영역 (광각 마진 추가)
+            l_tl_x = int(w * min(self.tl_r, 0.15))
+            l_tr_x = int(w * 0.52)
+            l_br_x = int(w * 0.55)
+            l_bl_x = int(w * min(self.bl_r, 0.05))
+
+        l_corners = np.array([[(l_tl_x, top_y), (l_tr_x, top_y), (l_br_x, bot_y), (l_bl_x, bot_y)]], dtype=np.int32)
+        l_xs = [l_tl_x, l_tr_x, l_br_x, l_bl_x]
+        l_bbox = (max(0, min(l_xs) - 4), top_y, min(w, max(l_xs) + 4), bot_y)
+
+        # [우측 차선 ROI]
+        if prev_right is not None and not is_right_lost:
+            px_t, _, px_b = prev_right
+            margin = int(48 * (w / 960.0))
+            r_tl_x = max(20, int(px_t - margin * 1.5))
+            r_tr_x = min(w, int(px_t + margin * 1.5))
+            r_bl_x = max(10, int(px_b - margin * 1.8))
+            r_br_x = min(w, int(px_b + margin * 2.0))
+        else:
+            r_tl_x = int(w * 0.48)
+            r_tr_x = int(w * max(self.tr_r, 0.85))
+            r_br_x = int(w * max(self.br_r, 0.95))
+            r_bl_x = int(w * 0.45)
+
+        r_corners = np.array([[(r_tl_x, top_y), (r_tr_x, top_y), (r_br_x, bot_y), (r_bl_x, bot_y)]], dtype=np.int32)
+        r_xs = [r_tl_x, r_tr_x, r_br_x, r_bl_x]
+        r_bbox = (max(0, min(r_xs) - 4), top_y, min(w, max(r_xs) + 4), bot_y)
+
+        return (l_corners, l_bbox), (r_corners, r_bbox)
+
+
+def crop_roi(
     frame: np.ndarray,
-    roi_corners: np.ndarray,
+    corners: np.ndarray,
     bbox: Tuple[int, int, int, int],
     target_size: Optional[Tuple[int, int]] = None
 ) -> Tuple[np.ndarray, Tuple[int, int, float, float]]:
-    """Bounding Box 영역 슬라이싱 후 사다리꼴 마스크 적용."""
     h_img, w_img = frame.shape[:2]
     xmin, ymin, xmax, ymax = bbox
 
@@ -122,10 +344,9 @@ def crop_and_resize_roi(
 
     crop_w = xmax - xmin
     crop_h = ymax - ymin
-
     cropped = frame[ymin:ymax, xmin:xmax]
 
-    rel_corners = roi_corners.copy()
+    rel_corners = corners.copy()
     rel_corners[0, :, 0] = np.clip(rel_corners[0, :, 0] - xmin, 0, crop_w - 1)
     rel_corners[0, :, 1] = np.clip(rel_corners[0, :, 1] - ymin, 0, crop_h - 1)
 
@@ -133,842 +354,752 @@ def crop_and_resize_roi(
     cv2.fillPoly(mask, rel_corners, 255)
     masked_crop = cv2.bitwise_and(cropped, cropped, mask=mask)
 
-    if target_size is not None and (crop_w != target_size[0] or crop_h != target_size[1]):
-        target_w, target_h = target_size
-        resized_roi = cv2.resize(masked_crop, target_size, interpolation=cv2.INTER_AREA)
-        scale_x = crop_w / float(target_w)
-        scale_y = crop_h / float(target_h)
-    else:
-        resized_roi = masked_crop
-        scale_x = 1.0
-        scale_y = 1.0
+    if target_size is not None and target_size[0] > 0 and target_size[1] > 0:
+        tw, th = target_size
+        resized = cv2.resize(masked_crop, (tw, th), interpolation=cv2.INTER_AREA)
+        return resized, (xmin, ymin, crop_w / float(tw), crop_h / float(th))
 
-    return resized_roi, (xmin, ymin, scale_x, scale_y)
+    return masked_crop, (xmin, ymin, 1.0, 1.0)
 
 
-def preprocess_roi(roi_img: np.ndarray, clahe_obj: Optional[cv2.CLAHE] = None) -> np.ndarray:
-    """노면 조명 변화에 강인한 적응형 히스토그램 평활화(CLAHE) 및 Canny 에지 추출."""
-    gray = cv2.cvtColor(roi_img, cv2.COLOR_BGR2GRAY)
-    if clahe_obj is not None:
-        enhanced = clahe_obj.apply(gray)
-    else:
-        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
-        enhanced = clahe.apply(gray)
-
-    blurred = cv2.GaussianBlur(enhanced, (5, 5), 0)
-    edges = cv2.Canny(blurred, 45, 130)
-    return edges
-
-
-def scale_lines_to_original(
-    lines: Optional[np.ndarray],
-    transform_params: Tuple[int, int, float, float]
-) -> Optional[np.ndarray]:
-    """로컬 ROI 좌표계의 선분들을 원본 프레임 좌표계로 역투영."""
+def scale_lines(lines: Optional[np.ndarray], params: Tuple[int, int, float, float]) -> Optional[np.ndarray]:
     if lines is None or len(lines) == 0:
         return None
-
-    xmin, ymin, scale_x, scale_y = transform_params
+    xmin, ymin, sx, sy = params
     orig_lines = []
-
-    for line in lines:
-        pts = line.flatten()
-        if len(pts) < 4:
-            continue
-        x1, y1, x2, y2 = pts[:4]
-        ox1 = int(round(x1 * scale_x + xmin))
-        oy1 = int(round(y1 * scale_y + ymin))
-        ox2 = int(round(x2 * scale_x + xmin))
-        oy2 = int(round(y2 * scale_y + ymin))
+    for l in lines:
+        pts = l.flatten()
+        if len(pts) < 4: continue
+        ox1 = int(round(pts[0] * sx + xmin))
+        oy1 = int(round(pts[1] * sy + ymin))
+        ox2 = int(round(pts[2] * sx + xmin))
+        oy2 = int(round(pts[3] * sy + ymin))
         orig_lines.append([[ox1, oy1, ox2, oy2]])
-
-    if len(orig_lines) == 0:
-        return None
-
-    return np.array(orig_lines, dtype=np.int32)
+    return np.array(orig_lines, dtype=np.int32) if orig_lines else None
 
 
-# ── 강건한 차선 피팅 (WLS + Outlier Rejection) ──────────────────────────────────
-def fit_lane_line_robust(
+# ── 6. 고강건 2차 곡선 피팅 (2nd-Order Robust Polynomial Fitting) ────────────
+def fit_lane_curve_robust(
     lines: Optional[np.ndarray],
-    is_left: bool = True,
-    min_slope: float = 0.40,
-    max_slope: float = 3.00,
-    min_line_count: int = 2,
-    min_total_length: float = 30.0,
-    min_y_span_ratio: float = 0.20,
-    roi_h: int = 100
+    is_left: bool,
+    min_slope: float = 0.20,
+    max_slope: float = 4.0,
+    min_line_len: float = 20.0,
+    roi_h: int = 150
 ) -> Tuple[Optional[List[float]], Dict[str, Any]]:
-    """가중 최소자승법(WLS)과 잔차 필터링을 결합한 1차 차선 방정식 피팅."""
-    metrics = {
-        "line_count": 0,
-        "total_length": 0.0,
-        "y_span": 0,
-        "rmse": 999.0,
-        "valid": False
-    }
-
+    """급커브 에지 아웃라이어 기각 문제를 해결한 2차 다항식(x = ay² + by + c) 피팅."""
+    metrics = {"valid": False, "degree": 1, "rmse": 999.0, "line_count": 0}
     if lines is None or len(lines) == 0:
         return None, metrics
 
-    pts_x = []
-    pts_y = []
-    weights = []
-    valid_lines = 0
-    total_length = 0.0
+    pts_x, pts_y, weights = [], [], []
+    valid_count = 0
+    total_len = 0.0
 
     for line in lines:
-        pts = line.flatten()
-        if len(pts) < 4:
-            continue
-        x1, y1, x2, y2 = pts[:4]
-        if x1 == x2:
-            continue
-
+        x1, y1, x2, y2 = line[0]
+        if x1 == x2: continue
         slope = (y2 - y1) / float(x2 - x1)
         abs_slope = abs(slope)
 
+        # 동적 완화 기울기 필터 (0.20 ~ 4.0)
         if abs_slope < min_slope or abs_slope > max_slope:
             continue
 
-        line_len = float(np.hypot(x2 - x1, y2 - y1))
-
-        # 좌측 차선(음의 기울기) / 우측 차선(양의 기울기)
-        if is_left and slope <= -min_slope:
+        l_len = float(np.hypot(x2 - x1, y2 - y1))
+        if is_left and (slope <= -min_slope or abs_slope >= 1.5):
             pts_x.extend([x1, x2])
             pts_y.extend([y1, y2])
-            weights.extend([line_len, line_len])
-            total_length += line_len
-            valid_lines += 1
-        elif not is_left and slope >= min_slope:
+            weights.extend([l_len, l_len])
+            valid_count += 1
+            total_len += l_len
+        elif not is_left and (slope >= min_slope or abs_slope >= 1.5):
             pts_x.extend([x1, x2])
             pts_y.extend([y1, y2])
-            weights.extend([line_len, line_len])
-            total_length += line_len
-            valid_lines += 1
+            weights.extend([l_len, l_len])
+            valid_count += 1
+            total_len += l_len
 
-    metrics["line_count"] = valid_lines
-    metrics["total_length"] = total_length
-
-    if valid_lines < min_line_count or total_length < min_total_length or len(pts_x) < 4:
+    metrics["line_count"] = valid_count
+    if valid_count < 2 or total_len < min_line_len or len(pts_x) < 4:
         return None, metrics
 
-    y_min, y_max = min(pts_y), max(pts_y)
-    y_span = y_max - y_min
-    metrics["y_span"] = y_span
-
-    if y_span < int(roi_h * min_y_span_ratio):
-        return None, metrics
+    y_arr = np.array(pts_y, dtype=np.float32)
+    x_arr = np.array(pts_x, dtype=np.float32)
+    w_arr = np.array(weights, dtype=np.float32)
 
     try:
-        w_arr = np.array(weights, dtype=np.float32)
-        fit = np.polyfit(pts_y, pts_x, 1, w=w_arr)
+        # 2차 곡선 피팅: x = a*y² + b*y + c
+        fit2 = np.polyfit(y_arr, x_arr, 2, w=w_arr)
+        pred_x = fit2[0] * (y_arr ** 2) + fit2[1] * y_arr + fit2[2]
+        residuals = np.abs(pred_x - x_arr)
 
-        pred_x = fit[0] * np.array(pts_y) + fit[1]
-        residuals = np.abs(pred_x - np.array(pts_x))
-        inliers_mask = residuals < 20.0  # 잔차 임계값 20px
-
-        if np.sum(inliers_mask) >= 4:
-            clean_y = np.array(pts_y)[inliers_mask]
-            clean_x = np.array(pts_x)[inliers_mask]
-            clean_w = w_arr[inliers_mask]
-            refined_fit = np.polyfit(clean_y, clean_x, 1, w=clean_w)
-            pred_x_clean = refined_fit[0] * clean_y + refined_fit[1]
-            rmse = float(np.sqrt(np.mean((pred_x_clean - clean_x) ** 2)))
-            metrics["rmse"] = rmse
+        # 35px 적응형 인라이어 필터링
+        inliers = residuals < 35.0
+        if np.sum(inliers) >= 4:
+            refined_fit = np.polyfit(y_arr[inliers], x_arr[inliers], 2, w=w_arr[inliers])
+            rmse = float(np.sqrt(np.mean((refined_fit[0]*(y_arr[inliers]**2) + refined_fit[1]*y_arr[inliers] + refined_fit[2] - x_arr[inliers]) ** 2)))
             metrics["valid"] = True
-            return list(refined_fit), metrics
+            metrics["rmse"] = rmse
+            metrics["degree"] = 2 if abs(refined_fit[0]) >= 1e-4 else 1
+            return [float(refined_fit[0]), float(refined_fit[1]), float(refined_fit[2])], metrics
         else:
-            rmse = float(np.sqrt(np.mean(residuals ** 2)))
-            metrics["rmse"] = rmse
             metrics["valid"] = True
-            return list(fit), metrics
+            metrics["degree"] = 2
+            return [float(fit2[0]), float(fit2[1]), float(fit2[2])], metrics
     except Exception:
         return None, metrics
 
 
-# ── 횡단보도 검출 함수 ────────────────────────────────────────────────────────
-def detect_crosswalk(
-    frame: np.ndarray,
-    top_ratio: float = 0.65,
-    bot_ratio: float = 0.88,
-    left_ratio: float = 0.22,
-    right_ratio: float = 0.78,
-    thresh_val: int = 175,
-    clahe_obj: Optional[cv2.CLAHE] = None
-) -> Tuple[bool, List[Tuple[int, int, int, int]]]:
-    """해상도 스케일링을 고려한 횡단보도(Zebra Stripe Pattern) 검출."""
-    h, w = frame.shape[:2]
-    scale = w / 640.0
-    y1 = int(h * top_ratio)
-    y2 = int(h * bot_ratio)
-    x1 = int(w * left_ratio)
-    x2 = int(w * right_ratio)
+# ── 7. 노면 표시 (횡단보도 & 정지선) 검출기 ──────────────────────────────────
+class RoadMarkingDetector:
+    """화살표/숫자 오탐을 배제한 횡단보도 검출 및 정지선(Stopline) 판별."""
 
-    road = frame[y1:y2, x1:x2]
-    if road.size == 0:
-        return False, []
+    def __init__(self, cfg: Dict[str, Any]):
+        self.enabled = cfg.get("enable", True)
+        self.min_stripes = int(cfg.get("crosswalk_min_stripes", 3))
+        self.stopline_min_width_ratio = float(cfg.get("stopline_min_width_ratio", 0.25))
+        self.stopline_max_slope = float(cfg.get("stopline_max_slope", 0.20))
 
-    gray = cv2.cvtColor(road, cv2.COLOR_BGR2GRAY)
-    if clahe_obj is not None:
-        enhanced = clahe_obj.apply(gray)
-    else:
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        enhanced = clahe.apply(gray)
+    def detect(self, frame: np.ndarray, roi_y_top: float, roi_y_bot: float) -> Tuple[bool, bool, List[Any], Optional[int]]:
+        if not self.enabled:
+            return False, False, [], None
 
-    _, thresh = cv2.threshold(enhanced, thresh_val, 255, cv2.THRESH_BINARY)
-    k_w = max(5, int(15 * scale))
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k_w, 3))
-    morph = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
+        h, w = frame.shape[:2]
+        y1, y2 = int(h * 0.60), int(h * 0.88)
+        road = frame[y1:y2, int(w * 0.18):int(w * 0.82)]
+        if road.size == 0:
+            return False, False, [], None
 
-    contours, _ = cv2.findContours(morph, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    stripes = 0
-    boxes = []
-    stripe_y_coords = []
+        gray = cv2.cvtColor(road, cv2.COLOR_BGR2GRAY)
+        _, thresh = cv2.threshold(gray, 195, 255, cv2.THRESH_BINARY)
+        scale = w / 960.0
+        kw = max(7, int(18 * scale))
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kw, 3))
+        morph = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
 
-    min_w = int(24 * scale)
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
-        if area < (80 * scale) or area > (14000 * scale * scale):
-            continue
-        rx, ry, rw, rh = cv2.boundingRect(cnt)
-        aspect = rw / float(max(1, rh))
-        if 1.8 <= aspect <= 16.0 and rw >= min_w:
-            stripes += 1
-            boxes.append((x1 + rx, y1 + ry, x1 + rx + rw, y1 + ry + rh))
-            stripe_y_coords.append(y1 + ry)
+        contours, _ = cv2.findContours(morph, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        stripes = 0
+        boxes = []
+        x_centers = []
+        is_stopline = False
+        stopline_y = None
 
-    is_crosswalk = stripes >= 3
-    if is_crosswalk and len(stripe_y_coords) >= 3:
-        y_span = max(stripe_y_coords) - min(stripe_y_coords)
-        if y_span < int((y2 - y1) * 0.20):
-            is_crosswalk = False
+        min_w = int(24 * scale)
+        for cnt in contours:
+            rx, ry, rw, rh = cv2.boundingRect(cnt)
+            aspect = rw / float(max(1, rh))
+            area = cv2.contourArea(cnt)
 
-    return is_crosswalk, boxes
+            # 정지선 판별 (가로로 매우 길고 얇은 선)
+            if rw > int(w * self.stopline_min_width_ratio) and rh <= int(25 * scale):
+                is_stopline = True
+                stopline_y = y1 + ry
+
+            # 횡단보도 지브라 스트라이프 판별
+            if 2.0 <= aspect <= 15.0 and rw >= min_w and rh >= int(7 * scale) and area > 100 * scale:
+                stripes += 1
+                abs_box = (int(w * 0.18) + rx, y1 + ry, int(w * 0.18) + rx + rw, y1 + ry + rh)
+                boxes.append(abs_box)
+                x_centers.append(abs_box[0] + rw / 2.0)
+
+        # 주기성(Spacing Uniformity) 검증으로 노면 화살표 배제
+        is_crosswalk = False
+        if stripes >= max(4, self.min_stripes) and len(x_centers) >= 4:
+            x_centers.sort()
+            spacings = np.diff(x_centers)
+            if (np.std(spacings) / (np.mean(spacings) + 1e-5)) < 0.48:
+                is_crosswalk = True
+
+        return is_crosswalk, is_stopline, boxes, stopline_y
 
 
-# ── [핵심 클래스] 고안정성 차선 추적 엔진 ─────────────────────────────────────
-class HighStabilityLaneTracker:
-    """좌표 공간 평활화, Slew-Rate 제한, 동적 ROI를 갖춘 무흔들림 차선 추적기."""
+# ── 8. 차선 변경 감지기 (Lane Change Detector) ────────────────────────────────
+class LaneChangeDetector:
+    """차선 중심 이탈(Drift) 누적으로 차선 변경 상태 머신 관리."""
 
-    def __init__(self, cfg: Optional[Dict[str, Any]] = None):
-        self.cfg = cfg or {}
+    def __init__(self, cfg: Dict[str, Any]):
+        self.drift_thresh = float(cfg.get("drift_threshold_px", 60.0))
+        self.cand_frames = int(cfg.get("candidate_frames", 5))
+        self.prog_frames = int(cfg.get("progress_frames", 10))
+
+        self.drift_count_left = 0
+        self.drift_count_right = 0
+        self.state = "NORMAL"
+
+    def update(self, center_offset_px: Optional[float]) -> str:
+        if center_offset_px is None:
+            self.drift_count_left = max(0, self.drift_count_left - 1)
+            self.drift_count_right = max(0, self.drift_count_right - 1)
+            if self.drift_count_left == 0 and self.drift_count_right == 0:
+                self.state = "NORMAL"
+            return self.state
+
+        if center_offset_px > self.drift_thresh:
+            self.drift_count_right += 1
+            self.drift_count_left = 0
+        elif center_offset_px < -self.drift_thresh:
+            self.drift_count_left += 1
+            self.drift_count_right = 0
+        else:
+            self.drift_count_left = max(0, self.drift_count_left - 1)
+            self.drift_count_right = max(0, self.drift_count_right - 1)
+
+        if self.drift_count_right >= self.prog_frames:
+            self.state = "CHANGING_RIGHT"
+        elif self.drift_count_right >= self.cand_frames:
+            self.state = "CANDIDATE_RIGHT"
+        elif self.drift_count_left >= self.prog_frames:
+            self.state = "CHANGING_LEFT"
+        elif self.drift_count_left >= self.cand_frames:
+            self.state = "CANDIDATE_LEFT"
+        else:
+            self.state = "NORMAL"
+
+        return self.state
+
+
+# ── 9. 주행 상태 판단 (Optical Flow & Traffic Light State Machine) ─────────────
+class DrivingStateManager:
+    """Lucas-Kanade 광학 흐름 기반 감속/정지/출발 판정 및 신호등 감지."""
+
+    def __init__(self, state_cfg: Dict[str, Any]):
+        self.max_features = int(state_cfg.get("flow_max_features", 150))
+        self.stop_thresh = float(state_cfg.get("flow_stopped_threshold", 0.85))
+        self.decel_slope = float(state_cfg.get("flow_decel_slope", -0.04))
+        self.start_thresh = float(state_cfg.get("flow_start_threshold", 1.25))
+        self.win_size = int(state_cfg.get("window_size_frames", 25))
+        self.stop_persist = int(state_cfg.get("stopped_persistence_frames", 15))
+        self.hold_frames = int(state_cfg.get("state_hold_frames", 12))
+
+        self.prev_gray: Optional[np.ndarray] = None
+        self.flow_history: List[float] = []
+        self.stop_counter = 0
+        self.current_state = "CRUISING"
+        self.state_hold_timer = 0
+
+        # 신호등 설정
+        tl_cfg = state_cfg.get("traffic_light", {})
+        self.tl_top = float(tl_cfg.get("roi_top", 0.10))
+        self.tl_bot = float(tl_cfg.get("roi_bottom", 0.50))
+        self.tl_left = float(tl_cfg.get("roi_left", 0.15))
+        self.tl_right = float(tl_cfg.get("roi_right", 0.85))
+        self.tl_min_sat = int(tl_cfg.get("min_saturation", 120))
+        self.tl_min_val = int(tl_cfg.get("min_value", 180))
+
+    def update_optical_flow(self, frame_gray: np.ndarray) -> str:
+        avg_flow = 0.0
+        if self.prev_gray is not None:
+            p0 = cv2.goodFeaturesToTrack(self.prev_gray, maxCorners=self.max_features, qualityLevel=0.03, minDistance=10)
+            if p0 is not None and len(p0) > 8:
+                p1, st, _ = cv2.calcOpticalFlowPyrLK(self.prev_gray, frame_gray, p0, None)
+                if p1 is not None:
+                    good_new = p1[st == 1]
+                    good_old = p0[st == 1]
+                    if len(good_new) > 0:
+                        dists = np.hypot(good_new[:, 0] - good_old[:, 0], good_new[:, 1] - good_old[:, 1])
+                        avg_flow = float(np.median(dists))
+
+        self.prev_gray = frame_gray.copy()
+        self.flow_history.append(avg_flow)
+        if len(self.flow_history) > self.win_size:
+            self.flow_history.pop(0)
+
+        if avg_flow < self.stop_thresh:
+            self.stop_counter += 1
+        else:
+            self.stop_counter = max(0, self.stop_counter - 2)
+
+        if self.stop_counter >= self.stop_persist:
+            new_state = "STOPPED"
+        elif len(self.flow_history) >= 8:
+            x_axis = np.arange(len(self.flow_history))
+            slope, _ = np.polyfit(x_axis, self.flow_history, 1)
+            if slope < self.decel_slope and avg_flow < 2.5:
+                new_state = "DECELERATING"
+            elif avg_flow >= self.start_thresh and self.current_state == "STOPPED":
+                new_state = "STARTING"
+            else:
+                new_state = "CRUISING"
+        else:
+            new_state = "CRUISING"
+
+        if self.state_hold_timer > 0:
+            self.state_hold_timer -= 1
+        else:
+            if new_state != self.current_state:
+                self.current_state = new_state
+                self.state_hold_timer = self.hold_frames
+
+        return self.current_state
+
+    def detect_traffic_light(self, frame_bgr: np.ndarray) -> str:
+        h, w = frame_bgr.shape[:2]
+        tl_roi = frame_bgr[int(h * self.tl_top):int(h * self.tl_bot), int(w * self.tl_left):int(w * self.tl_right)]
+        if tl_roi.size == 0:
+            return "NONE"
+
+        hsv = cv2.cvtColor(tl_roi, cv2.COLOR_BGR2HSV)
+        red1 = cv2.inRange(hsv, np.array([0, self.tl_min_sat, self.tl_min_val]), np.array([10, 255, 255]))
+        red2 = cv2.inRange(hsv, np.array([170, self.tl_min_sat, self.tl_min_val]), np.array([180, 255, 255]))
+        red_mask = cv2.bitwise_or(red1, red2)
+        green_mask = cv2.inRange(hsv, np.array([45, self.tl_min_sat, self.tl_min_val]), np.array([88, 255, 255]))
+
+        red_pixels = cv2.countNonZero(red_mask)
+        green_pixels = cv2.countNonZero(green_mask)
+
+        if red_pixels > 40 and red_pixels > green_pixels * 1.5:
+            return "RED"
+        elif green_pixels > 40 and green_pixels > red_pixels * 1.5:
+            return "GREEN"
+        return "NONE"
+
+
+# ── 10. 전천후 곡선 적응형 메인 차선 추적기 (Integrated Tracker) ───────────────
+class FullVisionPipeline:
+    """settings.yaml 규격을 완벽 준수하는 종합 비전 분석 엔진."""
+
+    def __init__(self, settings: Dict[str, Any]):
+        self.cfg = settings
+        self.quality_analyzer = QualityAnalyzer(self.cfg.get("quality", {}))
+        self.preprocessor = ImagePreprocessor(self.cfg.get("preprocessing", {}))
+        self.roi_mgr = ROIManager(self.cfg.get("roi", {}))
+        self.marking_detector = RoadMarkingDetector(self.cfg.get("road_markings", {}))
+        self.lc_detector = LaneChangeDetector(self.cfg.get("lane_change", {}))
+        self.state_mgr = DrivingStateManager(self.cfg.get("state", {}))
+
         lane_cfg = self.cfg.get("lane", {})
-        roi_cfg = self.cfg.get("roi", {})
-        cw_cfg = self.cfg.get("crosswalk", {})
-
-        # 기하학 파라미터
-        self.top_ratio = float(roi_cfg.get("top_ratio", 0.67))
-        self.bot_ratio = float(roi_cfg.get("bottom_ratio", 0.88))
-        self.padding_x = int(roi_cfg.get("padding_x", 24))
-
-        # 허프 파라미터
-        self.hough_threshold = int(lane_cfg.get("hough_threshold", 22))
-        self.min_line_length = int(lane_cfg.get("min_line_length", 18))
-        self.max_line_gap = int(lane_cfg.get("max_line_gap", 45))
+        self.hough_thresh = int(lane_cfg.get("hough_threshold", 25))
+        self.min_line_len = float(lane_cfg.get("min_line_length", 20))
+        self.max_line_gap = int(lane_cfg.get("max_line_gap", 60))
         self.min_slope = float(lane_cfg.get("min_slope", 0.40))
-        self.max_slope = float(lane_cfg.get("max_slope", 3.00))
+        self.max_slope = float(lane_cfg.get("max_slope", 3.0))
+        self.max_lost_frames = int(lane_cfg.get("max_lost_frames", 30))
+        self.default_width_ratio = float(lane_cfg.get("default_lane_width_ratio", 0.45))
+        self.min_confidence = float(lane_cfg.get("min_confidence", 0.25))
 
-        # -------------------------------------------------------------
-        # [핵심 파라미터 1] 좌표계 기반 EMA 평활화 계수 (0.18: 부드러운 유도)
-        # -------------------------------------------------------------
-        self.coord_alpha = float(lane_cfg.get("coord_alpha", 0.18))
-
-        # -------------------------------------------------------------
-        # [핵심 파라미터 2] Slew-Rate 제한 (프레임당 최대 이동 픽셀 클램핑)
-        # 30fps 기준 급격한 노이즈로 차선이 수십 픽셀 순간 이동하는 것을 방지
-        # -------------------------------------------------------------
-        self.max_slew_top = float(lane_cfg.get("max_slew_top", 12.0))   # 상단 최대 12px/프레임
-        self.max_slew_bot = float(lane_cfg.get("max_slew_bot", 18.0))   # 하단 최대 18px/프레임
-
-        # -------------------------------------------------------------
-        # [핵심 파라미터 3] 감쇠 홀드 (Graceful Decay Hold)
-        # 점선 구간에서 검출이 순간 끊겨도 최대 12프레임 동안 부드럽게 지탱
-        # -------------------------------------------------------------
-        self.max_hold_frames = int(lane_cfg.get("max_hold_frames", 12))
-        self.decay_factor = float(lane_cfg.get("decay_factor", 0.94))
-
-        # 좌표 공간 상태 변수 (x_top, x_bot)
-        self.smooth_left_pts: Optional[Tuple[float, float]] = None
-        self.smooth_right_pts: Optional[Tuple[float, float]] = None
-        self.lost_left_count: int = 0
-        self.lost_right_count: int = 0
-        self.left_confidence: float = 0.0
-        self.right_confidence: float = 0.0
-
-        # 횡단보도 상태 머신 (히스테리시스)
-        self.cw_detect_count = 0
-        self.is_crosswalk_state = False
-        self.cw_hysteresis_enter = int(cw_cfg.get("hysteresis_enter", 2))
-        self.cw_hysteresis_exit = int(cw_cfg.get("hysteresis_exit", 2))
-        self.cw_thresh = int(cw_cfg.get("threshold", 175))
-
-        # CLAHE 객체 사전 할당
-        self._clahe_left = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
-        self._clahe_right = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
-        self._clahe_cw = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-
-    def detect_crosswalk(self, frame: np.ndarray) -> Tuple[bool, List[Tuple[int, int, int, int]]]:
-        raw_detected, boxes = detect_crosswalk(
-            frame,
-            top_ratio=0.65,
-            bot_ratio=0.88,
-            thresh_val=self.cw_thresh,
-            clahe_obj=self._clahe_cw
-        )
-
-        if raw_detected:
-            self.cw_detect_count = min(self.cw_hysteresis_enter, self.cw_detect_count + 1)
-            if self.cw_detect_count >= self.cw_hysteresis_enter:
-                self.is_crosswalk_state = True
-        else:
-            self.cw_detect_count = max(0, self.cw_detect_count - 1)
-            if self.cw_detect_count == 0:
-                self.is_crosswalk_state = False
-
-        return self.is_crosswalk_state, boxes
-
-    def _detect_single_roi(
-        self,
-        frame: np.ndarray,
-        corners: np.ndarray,
-        bbox: Tuple[int, int, int, int],
-        clahe_obj: cv2.CLAHE,
-        is_left: bool,
-        cw_boxes: List[Tuple[int, int, int, int]]
-    ) -> Tuple[Optional[List[float]], Optional[np.ndarray], np.ndarray, Dict[str, Any]]:
-        h, w = frame.shape[:2]
-        roi_img, params = crop_and_resize_roi(frame, corners, bbox)
-        edges = preprocess_roi(roi_img, clahe_obj=clahe_obj)
-
-        xmin, ymin, scale_x, scale_y = params
-        if cw_boxes and len(cw_boxes) > 0:
-            for bx1, by1, bx2, by2 in cw_boxes:
-                lx1 = int(round(max(0, bx1 - xmin) / scale_x))
-                lx2 = int(round(max(0, bx2 - xmin) / scale_x))
-                ly1 = int(round(max(0, by1 - ymin) / scale_y))
-                ly2 = int(round(max(0, by2 - ymin) / scale_y))
-                eh, ew = edges.shape[:2]
-                if lx1 < ew and ly1 < eh and lx2 > 0 and ly2 > 0:
-                    edges[max(0, ly1):min(eh, ly2), max(0, lx1):min(ew, lx2)] = 0
-
-        lines_roi = cv2.HoughLinesP(
-            edges,
-            rho=1,
-            theta=np.pi / 180,
-            threshold=self.hough_threshold,
-            minLineLength=self.min_line_length,
-            maxLineGap=self.max_line_gap
-        )
-
-        lines_orig = scale_lines_to_original(lines_roi, params)
-
-        fit, metrics = fit_lane_line_robust(
-            lines_orig,
-            is_left=is_left,
-            min_slope=self.min_slope,
-            max_slope=self.max_slope,
-            roi_h=int(h * (self.bot_ratio - self.top_ratio))
-        )
-
-        return fit, lines_orig, edges, metrics
-
-    # -------------------------------------------------------------------------
-    # [핵심 알고리즘] 좌표 공간(Coordinate-Space) 평활화 및 Slew-Rate 제한
-    # -------------------------------------------------------------------------
-    def _smooth_lane_coordinates(
-        self,
-        meas_fit: Optional[List[float]],
-        prev_pts: Optional[Tuple[float, float]],
-        lost_count: int,
-        prev_conf: float,
-        y_top: float,
-        y_bot: float
-    ) -> Tuple[Optional[Tuple[float, float]], int, float]:
-        """기울기/절편 대신 실제 노면 상단/하단 x좌표를 직접 평활화하여 시소 흔들림 방지."""
-        if meas_fit is not None:
-            # 1. 측정된 직선을 y_top, y_bot에서의 픽셀 좌표로 환산
-            meas_xt = evaluate_poly_x(meas_fit, y_top)
-            meas_xb = evaluate_poly_x(meas_fit, y_bot)
-
-            if prev_pts is None:
-                # 첫 검출 시에는 즉시 수렴
-                return (meas_xt, meas_xb), 0, 0.90
-            else:
-                prev_xt, prev_xb = prev_pts
-
-                # 2. Slew-Rate Clamping (한 프레임당 최대 이동 픽셀 제한)
-                d_xt = np.clip(meas_xt - prev_xt, -self.max_slew_top, self.max_slew_top)
-                d_xb = np.clip(meas_xb - prev_xb, -self.max_slew_bot, self.max_slew_bot)
-
-                target_xt = prev_xt + d_xt
-                target_xb = prev_xb + d_xb
-
-                # 3. 부드러운 지수이동평균(EMA) 융합
-                smooth_xt = self.coord_alpha * target_xt + (1.0 - self.coord_alpha) * prev_xt
-                smooth_xb = self.coord_alpha * target_xb + (1.0 - self.coord_alpha) * prev_xb
-
-                new_conf = min(1.0, prev_conf * 0.8 + 0.20)
-                return (smooth_xt, smooth_xb), 0, new_conf
-
-        else:
-            # 미검출 시 (점선 사이 빈 공간 등) -> 이전 위치를 유지하며 신뢰도를 점진적 감쇠
-            new_lost = lost_count + 1
-            if prev_pts is not None and new_lost <= self.max_hold_frames:
-                decayed_conf = prev_conf * self.decay_factor
-                return prev_pts, new_lost, decayed_conf
-            else:
-                return None, new_lost, 0.0
-
-    @staticmethod
-    def _pts_to_polyfit(pts: Optional[Tuple[float, float]], y_top: float, y_bot: float) -> Optional[List[float]]:
-        """평활화된 (x_top, x_bot) 좌표를 다시 x = m*y + c 표준 계수 형태로 역환산."""
-        if pts is None:
-            return None
-        xt, xb = pts
-        dy = y_bot - y_top
-        if abs(dy) < 1e-4:
-            return None
-        m = (xb - xt) / dy
-        c = xt - m * y_top
-        return [float(m), float(c)]
-
-    def detect(
-        self,
-        frame: np.ndarray,
-        is_crosswalk: Optional[bool] = None
-    ) -> Tuple[Optional[List[float]], Optional[List[float]], bool, Dict[str, Any]]:
-        """메인 차선 검출 파이프라인 호출."""
-        h, w = frame.shape[:2]
-        y_top = float(h * self.top_ratio)
-        y_bot = float(h * self.bot_ratio)
-
-        # 1. 횡단보도 상태 확인
-        cw_boxes = []
-        if is_crosswalk is None:
-            is_crosswalk_detected, cw_boxes = self.detect_crosswalk(frame)
-        else:
-            is_crosswalk_detected = is_crosswalk
-            _, cw_boxes = detect_crosswalk(frame, top_ratio=0.65, bot_ratio=0.88, clahe_obj=self._clahe_cw)
-
-        # 횡단보도 확정 시: 차선 탐색 즉시 중단 및 ROI 화면 숨김
-        if is_crosswalk_detected:
-            self.smooth_left_pts = None
-            self.smooth_right_pts = None
-            self.lost_left_count = 0
-            self.lost_right_count = 0
-            debug_info = {
-                "cw_boxes": cw_boxes,
-                "confidence": 0.0,
-                "is_crosswalk": True,
-                "left_edges": np.zeros((100, 100), dtype=np.uint8),
-                "right_edges": np.zeros((100, 100), dtype=np.uint8),
-                "combined_edges": np.zeros((100, 200), dtype=np.uint8),
-                "held_left": False,
-                "held_right": False,
-            }
-            return None, None, True, debug_info
-
-        # 2. 동적 마진(Adaptive ROI) 생성
-        (left_corners, left_bbox), (right_corners, right_bbox) = get_dual_roi_geometry(
-            h, w,
-            top_ratio=self.top_ratio,
-            bot_ratio=self.bot_ratio,
-            padding_x=self.padding_x,
-            prev_left_pts=self.smooth_left_pts,
-            prev_right_pts=self.smooth_right_pts,
-        )
-
-        # 3. 좌/우 단일 ROI 에지 및 선분 추출
-        raw_left_fit, left_lines_orig, left_edges, left_metrics = self._detect_single_roi(
-            frame, left_corners, left_bbox, self._clahe_left, is_left=True, cw_boxes=cw_boxes
-        )
-
-        raw_right_fit, right_lines_orig, right_edges, right_metrics = self._detect_single_roi(
-            frame, right_corners, right_bbox, self._clahe_right, is_left=False, cw_boxes=cw_boxes
-        )
-
-        # 4. 좌표 공간 기반 고안정성 평활화 (Coordinate-Space Smoothing)
-        self.smooth_left_pts, self.lost_left_count, self.left_confidence = self._smooth_lane_coordinates(
-            raw_left_fit, self.smooth_left_pts, self.lost_left_count, self.left_confidence, y_top, y_bot
-        )
-
-        self.smooth_right_pts, self.lost_right_count, self.right_confidence = self._smooth_lane_coordinates(
-            raw_right_fit, self.smooth_right_pts, self.lost_right_count, self.right_confidence, y_top, y_bot
-        )
-
-        # 5. 차선 폭 기하학 유효성 검사 (좌우 교차 방지)
-        if self.smooth_left_pts is not None and self.smooth_right_pts is not None:
-            l_xt, l_xb = self.smooth_left_pts
-            r_xt, r_xb = self.smooth_right_pts
-            # 차선이 서로 교차하거나 폭이 너무 좁은 비정상 상태 방지
-            if l_xt >= r_xt or l_xb >= r_xb or (r_xb - l_xb) < (w * 0.20):
-                if self.left_confidence < self.right_confidence:
-                    self.smooth_left_pts = None
-                else:
-                    self.smooth_right_pts = None
-
-        final_left_fit = self._pts_to_polyfit(self.smooth_left_pts, y_top, y_bot)
-        final_right_fit = self._pts_to_polyfit(self.smooth_right_pts, y_top, y_bot)
-
-        # 통합 신뢰도
-        if final_left_fit is not None and final_right_fit is not None:
-            overall_conf = 0.5 * (self.left_confidence + self.right_confidence)
-        elif final_left_fit is not None:
-            overall_conf = 0.6 * self.left_confidence
-        elif final_right_fit is not None:
-            overall_conf = 0.6 * self.right_confidence
-        else:
-            overall_conf = 0.0
-
-        if left_edges.shape == right_edges.shape:
-            combined_edges = np.hstack([left_edges, right_edges])
-        else:
-            combined_edges = left_edges
-
-        debug_info = {
-            "left_corners": left_corners,
-            "right_corners": right_corners,
-            "left_bbox": left_bbox,
-            "right_bbox": right_bbox,
-            "left_edges": left_edges,
-            "right_edges": right_edges,
-            "combined_edges": combined_edges,
-            "cw_boxes": cw_boxes,
-            "confidence": float(overall_conf),
-            "is_crosswalk": False,
-            "held_left": self.lost_left_count > 0 and final_left_fit is not None,
-            "held_right": self.lost_right_count > 0 and final_right_fit is not None,
-        }
-
-        return final_left_fit, final_right_fit, False, debug_info
-
-    def reset(self):
-        self.smooth_left_pts = None
-        self.smooth_right_pts = None
+        self.smooth_left_pts: Optional[Tuple[float, float, float]] = None
+        self.smooth_right_pts: Optional[Tuple[float, float, float]] = None
         self.lost_left_count = 0
         self.lost_right_count = 0
-        self.left_confidence = 0.0
-        self.right_confidence = 0.0
-        self.cw_detect_count = 0
-        self.is_crosswalk_state = False
+        self.conf_left = 0.0
+        self.conf_right = 0.0
 
+    def process_frame(self, frame: np.ndarray) -> Dict[str, Any]:
+        h, w = frame.shape[:2]
+        y_top = float(h * self.roi_mgr.top_ratio)
+        y_bot = float(h * self.roi_mgr.bottom_ratio)
+        y_mid = float((y_top + y_bot) / 2.0)
 
-# ── HUD 렌더링 및 디스플레이 함수 ─────────────────────────────────────────────
-def draw_lane_hud(
-    frame: np.ndarray,
-    left_fit: Optional[List[float]],
-    right_fit: Optional[List[float]],
-    is_crosswalk: bool,
-    debug_info: Dict[str, Any],
-    fps: float = 0.0,
-    show_roi_boxes: bool = True
-) -> np.ndarray:
-    """프레임 위에 유도로, 안티 앨리어싱 차선, HUD 및 텔레메트리를 렌더링."""
-    out = frame.copy()
-    h, w = frame.shape[:2]
-    top_y = int(h * 0.67)
-    bot_y = int(h * 0.88)  # 무리한 100% 외삽 대신 유효 노면 영역(88%)까지만 안전 렌더링
+        # 1. 영상 품질 분석 (야간/블러 판정)
+        quality_res = self.quality_analyzer.analyze(frame)
+        is_night = quality_res["is_night"]
 
-    # 1. 듀얼 ROI 및 BBox 시각화 (횡단보도가 아닐 때만 표출)
-    if show_roi_boxes and not is_crosswalk:
-        if "left_corners" in debug_info and "right_corners" in debug_info:
-            cv2.polylines(out, [debug_info["left_corners"]], isClosed=True, color=(255, 200, 0), thickness=2, lineType=cv2.LINE_AA)
-            cv2.polylines(out, [debug_info["right_corners"]], isClosed=True, color=(0, 230, 100), thickness=2, lineType=cv2.LINE_AA)
-        if "left_bbox" in debug_info and "right_bbox" in debug_info:
-            lx1, ly1, lx2, ly2 = debug_info["left_bbox"]
-            rx1, ry1, rx2, ry2 = debug_info["right_bbox"]
-            cv2.rectangle(out, (lx1, ly1), (lx2, ly2), (255, 120, 0), 1)
-            cv2.rectangle(out, (rx1, ry1), (rx2, ry2), (0, 180, 80), 1)
+        # 2. 광학 흐름 및 신호등 감지
+        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        driving_state = self.state_mgr.update_optical_flow(gray_frame)
+        tl_state = self.state_mgr.detect_traffic_light(frame)
 
-    # 2. 횡단보도 줄무늬 박스 시각화
-    if "cw_boxes" in debug_info and debug_info["cw_boxes"]:
-        for bx1, by1, bx2, by2 in debug_info["cw_boxes"]:
-            cv2.rectangle(out, (bx1, by1), (bx2, by2), (0, 0, 255), 2)
-            cv2.putText(out, "ZEBRA", (bx1, max(15, by1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1, lineType=cv2.LINE_AA)
+        # 3. 횡단보도 및 정지선 검출
+        is_crosswalk, is_stopline, cw_boxes, stopline_y = self.marking_detector.detect(frame, y_top, y_bot)
 
-    # 3. 주행 통로(Driving Corridor) 및 차선 곡선 그리기
-    if not is_crosswalk:
-        if left_fit is not None and right_fit is not None:
-            # 부드러운 다각형 통로 계산
-            y_samples = np.linspace(top_y, bot_y, 16)
-            left_pts = [(int(round(evaluate_poly_x(left_fit, y))), int(round(y))) for y in y_samples]
-            right_pts = [(int(round(evaluate_poly_x(right_fit, y))), int(round(y))) for y in reversed(y_samples)]
-            poly_pts = np.array(left_pts + right_pts, dtype=np.int32)
+        # [권장 해결책] 횡단보도 감지 시 차선 상태를 None으로 삭제하지 않고 동결(Freeze) 유지
+        if is_crosswalk:
+            final_left = self._pts_to_polyfit2(self.smooth_left_pts, y_top, y_mid, y_bot)
+            final_right = self._pts_to_polyfit2(self.smooth_right_pts, y_top, y_mid, y_bot)
+            return {
+                "left_fit": final_left, "right_fit": final_right,
+                "confidence": 0.5, "is_crosswalk": True, "is_stopline": is_stopline,
+                "cw_boxes": cw_boxes, "driving_state": "HOLD/STOP (CROSSWALK)",
+                "tl_state": tl_state, "lane_change": "NORMAL", "quality": quality_res,
+                "edge_pip": np.zeros((100, 100), dtype=np.uint8)
+            }
 
-            # 반투명 에메랄드 주행 통로
-            overlay = out.copy()
-            cv2.fillPoly(overlay, [poly_pts], (0, 210, 90))
-            cv2.addWeighted(overlay, 0.28, out, 0.72, 0, out)
-
-            # 좌측 차선 (청록색) & 우측 차선 (네온 그린)
-            lx_top = int(round(evaluate_poly_x(left_fit, top_y)))
-            lx_bot = int(round(evaluate_poly_x(left_fit, bot_y)))
-            rx_top = int(round(evaluate_poly_x(right_fit, top_y)))
-            rx_bot = int(round(evaluate_poly_x(right_fit, bot_y)))
-
-            cv2.line(out, (lx_top, top_y), (lx_bot, bot_y), (255, 255, 0), thickness=4, lineType=cv2.LINE_AA)
-            cv2.line(out, (rx_top, top_y), (rx_bot, bot_y), (0, 255, 120), thickness=4, lineType=cv2.LINE_AA)
-
-            # 목표 주행 궤적 중심선
-            cx_top = int((lx_top + rx_top) / 2)
-            cx_bot = int((lx_bot + rx_bot) / 2)
-            cv2.line(out, (cx_top, top_y), (cx_bot, bot_y), (0, 140, 255), thickness=2, lineType=cv2.LINE_AA)
-            cv2.circle(out, (cx_top, top_y), 5, (0, 255, 255), -1, lineType=cv2.LINE_AA)
-            cv2.circle(out, (w // 2, bot_y), 6, (0, 0, 255), -1, lineType=cv2.LINE_AA)
-
-        elif left_fit is not None:
-            lx_top = int(round(evaluate_poly_x(left_fit, top_y)))
-            lx_bot = int(round(evaluate_poly_x(left_fit, bot_y)))
-            cv2.line(out, (lx_top, top_y), (lx_bot, bot_y), (255, 255, 0), thickness=4, lineType=cv2.LINE_AA)
-
-        elif right_fit is not None:
-            rx_top = int(round(evaluate_poly_x(right_fit, top_y)))
-            rx_bot = int(round(evaluate_poly_x(right_fit, bot_y)))
-            cv2.line(out, (rx_top, top_y), (rx_bot, bot_y), (0, 255, 120), thickness=4, lineType=cv2.LINE_AA)
-
-    else:
-        # 횡단보도 정지 안내 배너 표시
-        banner_w, banner_h = 380, 42
-        bx = (w - banner_w) // 2
-        by = int(h * 0.52)
-        banner_bg = out.copy()
-        cv2.rectangle(banner_bg, (bx, by), (bx + banner_w, by + banner_h), (0, 0, 220), -1)
-        cv2.addWeighted(banner_bg, 0.85, out, 0.15, 0, out)
-        cv2.rectangle(out, (bx, by), (bx + banner_w, by + banner_h), (0, 0, 255), 2)
-        cv2.putText(
-            out, "CROSSWALK DETECTED - HOLD / STOP",
-            (bx + 18, by + 28),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, lineType=cv2.LINE_AA
+        # 4. 동적 ROI 및 Wide Fallback 획득
+        (l_corners, l_bbox), (r_corners, r_bbox) = self.roi_mgr.get_dual_rois(
+            h, w, self.smooth_left_pts, self.smooth_right_pts,
+            is_left_lost=self.lost_left_count > 3, is_right_lost=self.lost_right_count > 3
         )
 
-    # 4. 오른쪽 상단 PiP 에지 맵 렌더링
-    if "combined_edges" in debug_info and debug_info["combined_edges"] is not None:
-        edge_map = debug_info["combined_edges"]
+        # 5. 좌/우 ROI 크롭 및 HLS 전처리
+        l_crop, l_params = crop_roi(frame, l_corners, l_bbox)
+        r_crop, r_params = crop_roi(frame, r_corners, r_bbox)
+
+        l_edges = self.preprocessor.process_roi(l_crop, is_night=is_night)
+        r_edges = self.preprocessor.process_roi(r_crop, is_night=is_night)
+
+        # 6. 허프 변환
+        l_lines_roi = cv2.HoughLinesP(l_edges, 1, np.pi/180, self.hough_thresh, minLineLength=self.min_line_len, maxLineGap=self.max_line_gap)
+        r_lines_roi = cv2.HoughLinesP(r_edges, 1, np.pi/180, self.hough_thresh, minLineLength=self.min_line_len, maxLineGap=self.max_line_gap)
+
+        l_lines = scale_lines(l_lines_roi, l_params)
+        r_lines = scale_lines(r_lines_roi, r_params)
+
+        # 7. 2차 다항식 곡선 피팅
+        raw_l_fit, _ = fit_lane_curve_robust(l_lines, is_left=True, min_slope=self.min_slope * 0.5, max_slope=self.max_slope * 1.4)
+        raw_r_fit, _ = fit_lane_curve_robust(r_lines, is_left=False, min_slope=self.min_slope * 0.5, max_slope=self.max_slope * 1.4)
+
+        # 8. 3점 화면 좌표계 스무딩 & 칼만/EMA 보정
+        self.smooth_left_pts, self.lost_left_count, self.conf_left = self._smooth_pts(
+            raw_l_fit, self.smooth_left_pts, self.lost_left_count, self.conf_left, y_top, y_mid, y_bot, w
+        )
+        self.smooth_right_pts, self.lost_right_count, self.conf_right = self._smooth_pts(
+            raw_r_fit, self.smooth_right_pts, self.lost_right_count, self.conf_right, y_top, y_mid, y_bot, w
+        )
+
+        # 9. 편측 검출 시 default_lane_width_ratio 기반 반대편 차선 추정
+        default_w = w * self.default_width_ratio
+        if self.smooth_left_pts is not None and self.smooth_right_pts is None:
+            lt, lm, lb = self.smooth_left_pts
+            self.smooth_right_pts = (lt + default_w * 0.7, lm + default_w * 0.85, lb + default_w)
+            self.conf_right = self.conf_left * 0.65
+        elif self.smooth_right_pts is not None and self.smooth_left_pts is None:
+            rt, rm, rb = self.smooth_right_pts
+            self.smooth_left_pts = (rt - default_w * 0.7, rm - default_w * 0.85, rb - default_w)
+            self.conf_left = self.conf_right * 0.65
+
+        final_l = self._pts_to_polyfit2(self.smooth_left_pts, y_top, y_mid, y_bot)
+        final_r = self._pts_to_polyfit2(self.smooth_right_pts, y_top, y_mid, y_bot)
+
+        # 10. 차선 변경(Lane Change) 상태 업데이트
+        center_offset = None
+        if self.smooth_left_pts and self.smooth_right_pts:
+            lane_center_x = (self.smooth_left_pts[2] + self.smooth_right_pts[2]) / 2.0
+            center_offset = (w / 2.0) - lane_center_x
+        lc_state = self.lc_detector.update(center_offset)
+
+        overall_conf = 0.5 * (self.conf_left + self.conf_right) if (final_l and final_r) else 0.0
+
+        edge_pip = np.hstack([l_edges, r_edges]) if l_edges.shape == r_edges.shape else l_edges
+
+        return {
+            "left_fit": final_l, "right_fit": final_r,
+            "confidence": float(overall_conf), "is_crosswalk": is_crosswalk, "is_stopline": is_stopline,
+            "cw_boxes": cw_boxes, "driving_state": driving_state, "tl_state": tl_state,
+            "lane_change": lc_state, "quality": quality_res, "edge_pip": edge_pip,
+            "left_corners": l_corners, "right_corners": r_corners,
+            "center_offset": center_offset
+        }
+
+    def _smooth_pts(
+        self,
+        meas_fit: Optional[List[float]],
+        prev: Optional[Tuple[float, float, float]],
+        lost: int,
+        conf: float,
+        yt: float,
+        ym: float,
+        yb: float,
+        w: int
+    ) -> Tuple[Optional[Tuple[float, float, float]], int, float]:
+        if meas_fit is not None:
+            xt = evaluate_poly_x(meas_fit, yt)
+            xm = evaluate_poly_x(meas_fit, ym)
+            xb = evaluate_poly_x(meas_fit, yb)
+            if prev is None:
+                return (xt, xm, xb), 0, 0.90
+            else:
+                pxt, pxm, pxb = prev
+                scale = w / 960.0
+                max_slew = 28.0 * scale
+                d_xt = np.clip(xt - pxt, -max_slew, max_slew)
+                d_xm = np.clip(xm - pxm, -max_slew * 1.2, max_slew * 1.2)
+                d_xb = np.clip(xb - pxb, -max_slew * 1.5, max_slew * 1.5)
+
+                alpha = 0.30
+                sxt = alpha * (pxt + d_xt) + (1.0 - alpha) * pxt
+                sxm = alpha * (pxm + d_xm) + (1.0 - alpha) * pxm
+                sxb = alpha * (pxb + d_xb) + (1.0 - alpha) * pxb
+                return (sxt, sxm, sxb), 0, min(1.0, conf * 0.8 + 0.2)
+        else:
+            new_lost = lost + 1
+            if prev is not None and new_lost <= self.max_lost_frames:
+                return prev, new_lost, conf * 0.95
+            return None, new_lost, 0.0
+
+    @staticmethod
+    def _pts_to_polyfit2(pts: Optional[Tuple[float, float, float]], yt: float, ym: float, yb: float) -> Optional[List[float]]:
+        if pts is None: return None
+        try:
+            fit = np.polyfit([yt, ym, yb], [pts[0], pts[1], pts[2]], 2)
+            return [float(fit[0]), float(fit[1]), float(fit[2])]
+        except Exception:
+            return None
+
+
+# ── 11. HUD 및 결과 시각화 모듈 (HUD Renderer) ───────────────────────────────
+def render_hud_display(
+    frame: np.ndarray,
+    res: Dict[str, Any],
+    vis_cfg: Dict[str, Any],
+    roi_top_r: float,
+    roi_bot_r: float,
+    fps: float
+) -> np.ndarray:
+    """settings.yaml의 visualization 설정을 충실히 반영하여 HUD 오버레이."""
+    out = frame.copy()
+    h, w = frame.shape[:2]
+    top_y = int(h * roi_top_r)
+    bot_y = int(h * roi_bot_r)
+
+    left_fit = res["left_fit"]
+    right_fit = res["right_fit"]
+
+    # 1. 주행 영역 반투명 채우기 (show_lane_polygon)
+    if vis_cfg.get("show_lane_polygon", True) and left_fit and right_fit:
+        steps = 18
+        y_pts = np.linspace(top_y, bot_y, steps)
+        l_pts = [(int(round(evaluate_poly_x(left_fit, y))), int(round(y))) for y in y_pts]
+        r_pts = [(int(round(evaluate_poly_x(right_fit, y))), int(round(y))) for y in reversed(y_pts)]
+        corridor = np.array(l_pts + r_pts, dtype=np.int32)
+
+        overlay = out.copy()
+        cv2.fillPoly(overlay, [corridor], (0, 215, 110))
+        cv2.addWeighted(overlay, 0.28, out, 0.72, 0, out)
+
+    # 2. 차선 및 중심 경로선 (show_center_path)
+    if left_fit:
+        y_pts = np.linspace(top_y, bot_y, 16)
+        pts = [(int(round(evaluate_poly_x(left_fit, y))), int(round(y))) for y in y_pts]
+        for i in range(len(pts) - 1):
+            cv2.line(out, pts[i], pts[i+1], (255, 255, 0), 4, lineType=cv2.LINE_AA)
+
+    if right_fit:
+        y_pts = np.linspace(top_y, bot_y, 16)
+        pts = [(int(round(evaluate_poly_x(right_fit, y))), int(round(y))) for y in y_pts]
+        for i in range(len(pts) - 1):
+            cv2.line(out, pts[i], pts[i+1], (0, 255, 120), 4, lineType=cv2.LINE_AA)
+
+    if vis_cfg.get("show_center_path", True) and left_fit and right_fit:
+        y_pts = np.linspace(top_y, bot_y, 16)
+        for y in y_pts:
+            cx = int((evaluate_poly_x(left_fit, y) + evaluate_poly_x(right_fit, y)) / 2.0)
+            cv2.circle(out, (cx, int(y)), 2, (0, 140, 255), -1)
+
+    # 3. 횡단보도 박스 표출
+    for bx1, by1, bx2, by2 in res.get("cw_boxes", []):
+        cv2.rectangle(out, (bx1, by1), (bx2, by2), (0, 0, 255), 2)
+        cv2.putText(out, "ZEBRA", (bx1, max(15, by1 - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
+
+    # 4. 우측 상단 미니맵 에지 뷰 (show_debug_minimap)
+    if vis_cfg.get("show_debug_minimap", True) and res.get("edge_pip") is not None:
+        edge_map = res["edge_pip"]
         eh, ew = edge_map.shape[:2]
         pip_w = 160
         pip_h = max(1, int(pip_w * (eh / float(max(1, ew)))))
-        pip_resized = cv2.resize(edge_map, (pip_w, pip_h), interpolation=cv2.INTER_NEAREST)
+        pip_resized = cv2.resize(edge_map, (pip_w, pip_h))
         pip_bgr = cv2.cvtColor(pip_resized, cv2.COLOR_GRAY2BGR)
         cv2.rectangle(pip_bgr, (0, 0), (pip_w - 1, pip_h - 1), (0, 255, 255), 1)
         out[10:10 + pip_h, w - pip_w - 10:w - 10] = pip_bgr
-        cv2.putText(out, "EDGE PiP", (w - pip_w - 8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 255), 1)
+        cv2.putText(out, "HLS-EDGE MAP", (w - pip_w - 8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 255), 1)
 
-    # 5. 왼쪽 상단 텔레메트리 HUD 박스
-    hud_bg = out.copy()
-    cv2.rectangle(hud_bg, (10, 10), (280, 140), (15, 23, 42), -1)
-    cv2.addWeighted(hud_bg, 0.85, out, 0.15, 0, out)
-    cv2.rectangle(out, (10, 10), (280, 140), (51, 65, 85), 1)
+    # 5. 주행 상태 및 지표 대시보드 HUD (show_hud_card)
+    if vis_cfg.get("show_hud_card", True):
+        card_w, card_h = 310, 165
+        hud_bg = out.copy()
+        cv2.rectangle(hud_bg, (10, 10), (10 + card_w, 10 + card_h), (15, 23, 42), -1)
+        cv2.addWeighted(hud_bg, 0.85, out, 0.15, 0, out)
+        cv2.rectangle(out, (10, 10), (10 + card_w, 10 + card_h), (51, 65, 85), 1)
 
-    conf = debug_info.get("confidence", 0.0)
-    conf_color = (0, 255, 120) if conf >= 0.7 else ((0, 200, 255) if conf >= 0.4 else (0, 0, 255))
-    cv2.putText(out, f"FPS: {fps:.1f}  |  CONF: {conf*100:.0f}%", (20, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.48, conf_color, 1, lineType=cv2.LINE_AA)
+        conf = res.get("confidence", 0.0)
+        c_color = (0, 255, 120) if conf > 0.6 else (0, 180, 255)
+        cv2.putText(out, f"FPS: {fps:.1f} | CONF: {conf*100:.0f}%", (20, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.48, c_color, 1, lineType=cv2.LINE_AA)
+        cv2.putText(out, f"DRIVE STATE: {res.get('driving_state')}", (20, 56), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1)
+        cv2.putText(out, f"TRAFFIC LIGHT: {res.get('tl_state')}", (20, 78), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 255) if res.get('tl_state') != 'NONE' else (160, 160, 160), 1)
+        cv2.putText(out, f"LANE CHANGE: {res.get('lane_change')}", (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 180, 0) if res.get('lane_change') != 'NORMAL' else (180, 180, 180), 1)
 
-    l_str = f"L: x = {left_fit[0]:.2f}y + {left_fit[1]:.0f}" if left_fit else "L: LOST / SUPPRESSED"
-    r_str = f"R: x = {right_fit[0]:.2f}y + {right_fit[1]:.0f}" if right_fit else "R: LOST / SUPPRESSED"
-    cv2.putText(out, l_str, (20, 56), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (255, 255, 0), 1, lineType=cv2.LINE_AA)
-    cv2.putText(out, r_str, (20, 78), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 255, 120), 1, lineType=cv2.LINE_AA)
+        cw_str = "DETECTED" if res.get("is_crosswalk") else "CLEAR"
+        cv2.putText(out, f"CROSSWALK: {cw_str}", (20, 122), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 0, 255) if res.get("is_crosswalk") else (160, 160, 160), 1)
 
-    if is_crosswalk:
-        cw_text = "CROSSWALK: DETECTED"
-        cw_color = (0, 0, 255)
-        state_text = "STATE: HOLD / STOP (CW ACTIVE)"
-        state_color = (0, 0, 255)
-    else:
-        cw_text = "CROSSWALK: CLEAR"
-        cw_color = (150, 150, 150)
-        held_str = ""
-        if debug_info.get("held_left"):
-            held_str += "L-HOLD "
-        if debug_info.get("held_right"):
-            held_str += "R-HOLD "
-        if held_str:
-            state_text = f"STATE: {held_str}(SMOOTH)"
-            state_color = (0, 200, 255)
-        else:
-            state_text = "STATE: ACTIVE TRACKING"
-            state_color = (0, 255, 120)
-
-    cv2.putText(out, cw_text, (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.42, cw_color, 1, lineType=cv2.LINE_AA)
-    cv2.putText(out, state_text, (20, 122), cv2.FONT_HERSHEY_SIMPLEX, 0.40, state_color, 1, lineType=cv2.LINE_AA)
+        q = res.get("quality", {})
+        night_str = "NIGHT" if q.get("is_night") else "DAY"
+        cv2.putText(out, f"ENV: {night_str} (Bri: {q.get('brightness', 0):.0f})", (20, 144), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (200, 200, 200), 1)
 
     return out
 
 
-# ── 비디오 파이프라인 러너 ───────────────────────────────────────────────────
-def run_video_pipeline(
-    video_path: str,
-    output_path: Optional[str] = None,
-    show_window: bool = True,
-    cfg: Optional[Dict[str, Any]] = None,
-    max_frames: Optional[int] = None
-):
-    """비디오를 로드하여 고안정성 차선 추적 및 HUD 오버레이를 실시간 수행."""
-    resolved_path = video_path
-    if not os.path.exists(resolved_path):
-        candidates = [
-            os.path.join(os.path.dirname(__file__), video_path),
-            os.path.join(os.getcwd(), video_path),
-            f"/public/assets/aistudio/{video_path}",
-            f"public/assets/aistudio/{video_path}",
-            "/public/assets/aistudio/Test_Video_2_05bb47dc.mp4",
-            "public/assets/aistudio/Test_Video_2_05bb47dc.mp4",
-        ]
-        for cand in candidates:
-            if os.path.exists(cand):
-                resolved_path = cand
+# ── 12. 전체 파이프라인 메인 실행기 ───────────────────────────────────────────
+def main():
+    parser = argparse.ArgumentParser(description="dashcam_cv Autonomous Vision Pipeline")
+    parser.add_argument("--config", type=str, default="settings.yaml", help="설정 파일 경로 (.yaml)")
+    parser.add_argument("--input", type=str, default=None, help="비디오 입력 경로 (설정 덮어쓰기)")
+    parser.add_argument("--output", type=str, default=None, help="비디오 출력 경로 (설정 덮어쓰기)")
+    parser.add_argument("--max-frames", type=int, default=None, help="최대 처리 프레임수")
+    args = parser.parse_args()
+
+    # 1. 설정 로드
+    cfg_path = args.config
+    if not os.path.exists(cfg_path):
+        candidates = ["settings.yaml", "settings_39559988.yaml", "public/assets/aistudio/settings_39559988.yaml"]
+        for c in candidates:
+            if os.path.exists(c):
+                cfg_path = c
                 break
 
-    if not os.path.exists(resolved_path):
-        print(f"[Error] 비디오 파일을 찾을 수 없습니다: {video_path}")
+    settings = load_settings(cfg_path)
+    video_cfg = settings["video"]
+    vis_cfg = settings["visualization"]
+
+    input_path = args.input or video_cfg.get("input_path", "data/Test_Video_2.mp4")
+    output_path = args.output or video_cfg.get("output_video", "outputs/annotated_video.mp4")
+    target_w = int(video_cfg.get("target_width", 960))
+    stride = max(1, int(video_cfg.get("frame_stride", 1)))
+    max_frames = args.max_frames or int(video_cfg.get("max_frames", 0))
+
+    if not os.path.exists(input_path):
+        for alt in [
+            input_path,
+            "Test_Video_2.mp4",
+            "Test_Video_2_05bb47dc.mp4",
+            "data/Test_Video_2.mp4",
+            "public/assets/aistudio/Test_Video_2_05bb47dc.mp4",
+        ]:
+            if os.path.exists(alt):
+                input_path = alt
+                break
+
+    if not os.path.exists(input_path):
+        print(f"[!] 입력 비디오 파일을 찾을 수 없습니다: {input_path}")
         return
 
-    print("=" * 75)
-    print(f"[*] 고안정성 차선 추적기 (High-Stability Lane Tracker) 시작: {resolved_path}")
-    print("=" * 75)
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    frame_log_path = video_cfg.get("output_frame_log", "outputs/frame_log.csv")
+    perf_log_path = video_cfg.get("output_perf_log", "outputs/performance.csv")
+    summary_path = video_cfg.get("output_summary", "outputs/summary.json")
+    os.makedirs(os.path.dirname(frame_log_path) or ".", exist_ok=True)
 
-    cap = cv2.VideoCapture(resolved_path)
+    cap = cv2.VideoCapture(input_path)
     if not cap.isOpened():
-        print(f"[Error] 비디오 파일을 열 수 없습니다: {resolved_path}")
+        print(f"[!] 비디오를 열 수 없습니다: {input_path}")
         return
 
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps_in = cap.get(cv2.CAP_PROP_FPS) or 30.0
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    print(f"    - 비디오 해상도: {width} x {height}")
-    print(f"    - 입력 FPS: {fps_in:.1f}")
-    print(f"    - 총 프레임 수: {total_frames}")
+    if target_w > 0:
+        proc_w = target_w
+        proc_h = int(orig_h * (proc_w / float(orig_w)))
+    else:
+        proc_w, proc_h = orig_w, orig_h
 
-    writer = None
-    if output_path is not None:
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(output_path, fourcc, fps_in, (width, height))
-        print(f"    - 결과 저장 경로: {output_path}")
+    print("=" * 78)
+    print(f"[*] dashcam_cv 비전 파이프라인 가동: {input_path}")
+    print(f"    - 처리 해상도: {proc_w} x {proc_h} (원본 {orig_w}x{orig_h})")
+    print(f"    - 입력 FPS: {fps_in:.1f} | 스트라이드: {stride}")
+    print(f"    - 결과 저장: {output_path}")
+    print("=" * 78)
 
-    detector = HighStabilityLaneTracker(cfg=cfg)
+    codec_str = video_cfg.get("codec", "mp4v")
+    fourcc = cv2.VideoWriter_fourcc(*codec_str)
+    writer = cv2.VideoWriter(output_path, fourcc, fps_in / stride, (proc_w, proc_h))
+
+    pipeline = FullVisionPipeline(settings)
 
     frame_idx = 0
+    processed_count = 0
     t_start = time.time()
     prev_time = time.time()
-    fps_display = fps_in
-    paused = False
+    fps_metric = fps_in
+
+    # CSV 로그 초기화
+    f_frame_log = open(frame_log_path, "w", newline="", encoding="utf-8")
+    frame_logger = csv.writer(f_frame_log)
+    frame_logger.writerow(["frame_id", "confidence", "driving_state", "lane_change", "is_crosswalk", "is_stopline", "traffic_light"])
+
+    f_perf_log = open(perf_log_path, "w", newline="", encoding="utf-8")
+    perf_logger = csv.writer(f_perf_log)
+    perf_logger.writerow(["frame_id", "elapsed_ms", "fps"])
+
+    state_distribution: Dict[str, int] = {}
+    crosswalk_detected_frames = 0
 
     try:
         while True:
-            if not paused:
-                ret, frame = cap.read()
-                if not ret:
-                    print("\n[*] 비디오 재생 완료 (End of Video).")
+            ret, frame = cap.read()
+            if not ret:
+                break
+            frame_idx += 1
+
+            if stride > 1 and (frame_idx % stride != 0):
+                continue
+
+            t_frame_start = time.time()
+
+            if proc_w != orig_w or proc_h != orig_h:
+                frame_resized = cv2.resize(frame, (proc_w, proc_h))
+            else:
+                frame_resized = frame
+
+            # 파이프라인 실행
+            result = pipeline.process_frame(frame_resized)
+            processed_count += 1
+
+            t_frame_end = time.time()
+            elapsed_ms = (t_frame_end - t_frame_start) * 1000.0
+            dt = t_frame_end - prev_time
+            prev_time = t_frame_end
+            if dt > 0:
+                fps_metric = 0.9 * fps_metric + 0.1 * (1.0 / dt)
+
+            # 로그 기록
+            frame_logger.writerow([
+                frame_idx, f"{result['confidence']:.2f}", result["driving_state"],
+                result["lane_change"], int(result["is_crosswalk"]), int(result["is_stopline"]), result["tl_state"]
+            ])
+            perf_logger.writerow([frame_idx, f"{elapsed_ms:.1f}", f"{fps_metric:.1f}"])
+
+            state_distribution[result["driving_state"]] = state_distribution.get(result["driving_state"], 0) + 1
+            if result["is_crosswalk"]:
+                crosswalk_detected_frames += 1
+
+            # HUD 렌더링 및 비디오 저장
+            annotated = render_hud_display(
+                frame_resized, result, vis_cfg,
+                settings["roi"]["top_ratio"], settings["roi"]["bottom_ratio"], fps=fps_metric
+            )
+            writer.write(annotated)
+
+            if vis_cfg.get("display_window", False):
+                cv2.imshow("dashcam_cv Annotated View", annotated)
+                if cv2.waitKey(1) & 0xFF == ord('q'):
                     break
-                frame_idx += 1
 
-                # 고안정성 추적 파이프라인 실행
-                left_fit, right_fit, is_cw, debug = detector.detect(frame)
+            if processed_count % 30 == 0 or frame_idx == total_frames:
+                pct = (frame_idx / max(1, total_frames)) * 100
+                sys.stdout.write(f"\r진행률: [{frame_idx}/{total_frames}] {pct:.1f}% | 상태: {result['driving_state']} | FPS: {fps_metric:.1f}")
+                sys.stdout.flush()
 
-                # FPS 계산
-                cur_time = time.time()
-                dt = cur_time - prev_time
-                prev_time = cur_time
-                if dt > 0:
-                    fps_display = 0.9 * fps_display + 0.1 * (1.0 / dt)
-
-                # HUD 오버레이 렌더링
-                annotated = draw_lane_hud(
-                    frame, left_fit, right_fit, is_cw, debug, fps=fps_display, show_roi_boxes=True
-                )
-
-                if writer is not None:
-                    writer.write(annotated)
-
-                if frame_idx % 30 == 0 or frame_idx == total_frames:
-                    cw_badge = "[CW ACTIVE]" if is_cw else "[CLEAR]"
-                    sys.stdout.write(f"\r진행률: [{frame_idx}/{total_frames}] {frame_idx/max(1, total_frames)*100:.1f}% | {cw_badge} | FPS: {fps_display:.1f}")
-                    sys.stdout.flush()
-
-                if max_frames and frame_idx >= max_frames:
-                    print(f"\n[*] 지정된 최대 프레임 수({max_frames}) 도달.")
-                    break
-
-            if show_window:
-                try:
-                    cv2.imshow("High-Stability Lane Tracker - Test_Video_2", annotated)
-                    key = cv2.waitKey(1) if not paused else 30 & 0xFF
-                    if key == ord('q'):
-                        print("\n[*] 사용자에 의해 재생 중단 (Quit).")
-                        break
-                    elif key == ord(' '):  # 일시정지/재개
-                        paused = not paused
-                    elif key == ord('r'):  # 리셋
-                        detector.reset()
-                except cv2.error:
-                    show_window = False
-
-    except KeyboardInterrupt:
-        print("\n[*] 강제 종료되었습니다.")
-    finally:
-        cap.release()
-        if writer is not None:
-            writer.release()
-        if show_window:
-            cv2.destroyAllWindows()
-
-        elapsed = time.time() - t_start
-        print(f"\n[완료] 총 {frame_idx} 프레임 처리 완료 (소요 시간: {elapsed:.2f}초, 평균 {frame_idx/max(0.001, elapsed):.1f} FPS)")
-
-
-# ── MAIN CLI ──────────────────────────────────────────────────────────────────
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="High-Stability Lane & Crosswalk Tracker")
-    parser.add_argument("--video", type=str, default="Test_Video_2_05bb47dc.mp4", help="비디오 파일 경로")
-    parser.add_argument("--output", type=str, default=None, help="처리된 결과 비디오 저장 경로")
-    parser.add_argument("--no-show", action="store_true", help="화면 창 띄우지 않고 백그라운드 처리")
-    parser.add_argument("--max-frames", type=int, default=None, help="처리할 최대 프레임 수")
-    args = parser.parse_args()
-
-    custom_cfg = {
-        "lane": {
-            "coord_alpha": 0.18,        # 좌표계 EMA 평활 계수 (낮을수록 더욱 부드러움)
-            "max_slew_top": 12.0,       # 상단 프레임당 최대 이동 12px (급격한 점프 방지)
-            "max_slew_bot": 18.0,       # 하단 프레임당 최대 이동 18px
-            "max_hold_frames": 12,      # 점선 누락 시 감쇠 유지 프레임
-            "decay_factor": 0.94,       # 유지 시 신뢰도 감쇠율
-            "hough_threshold": 22,
-            "min_line_length": 18,
-            "max_line_gap": 45,
-            "min_slope": 0.40,
-            "max_slope": 3.00,
-        },
-        "roi": {
-            "top_ratio": 0.67,
-            "bottom_ratio": 0.88,
-            "padding_x": 24             # 곡선 도로 추종용 동적 패딩 마진
-        },
-        "crosswalk": {
-            "threshold": 175,
-            "hysteresis_enter": 2,
-            "hysteresis_exit": 2
-        }
-    }
-
-    video_to_run = args.video
-    if not os.path.exists(video_to_run):
-        candidates = [
-            video_to_run,
-            "Test_Video_2.mp4",
-            "Test_Video_2_05bb47dc.mp4",
-            "dashcam_cv/data/Test_Video_2.mp4",
-        ]
-        for c in candidates:
-            if os.path.exists(c):
-                video_to_run = c
+            if max_frames > 0 and processed_count >= max_frames:
+                print(f"\n[*] 최대 프레임수({max_frames}) 처리 도달.")
                 break
 
-    run_video_pipeline(
-        video_path=video_to_run,
-        output_path=args.output,
-        show_window=not args.no_show,
-        cfg=custom_cfg,
-        max_frames=args.max_frames
-    )
+    finally:
+        cap.release()
+        writer.release()
+        f_frame_log.close()
+        f_perf_log.close()
+        if vis_cfg.get("display_window", False):
+            cv2.destroyAllWindows()
+
+        total_elapsed = time.time() - t_start
+        avg_fps = processed_count / max(0.001, total_elapsed)
+        print(f"\n[완료] 총 {processed_count} 프레임 처리 완료 (소요 시간: {total_elapsed:.2f}초, 평균 {avg_fps:.1f} FPS)")
+
+        summary_data = {
+            "input_video": input_path,
+            "output_video": output_path,
+            "processed_frames": processed_count,
+            "average_fps": round(avg_fps, 2),
+            "state_distribution": state_distribution,
+            "crosswalk_frames_count": crosswalk_detected_frames,
+            "config_used": settings
+        }
+        with open(summary_path, "w", encoding="utf-8") as f:
+            json.dump(summary_data, f, indent=2, ensure_ascii=False)
+        print(f"[*] 요약 리포트 저장 완료: {summary_path}")
+
+
+if __name__ == "__main__":
+    main()
