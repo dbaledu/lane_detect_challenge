@@ -28,8 +28,14 @@ class RoadMarkingDetector:
         self.last_stopline_box: Optional[Tuple[int, int, int, int]] = None
         self.stopline_missing_frames = 0
 
-    def detect(self, frame: np.ndarray, gray: np.ndarray, edges: np.ndarray) -> RoadMarkingResult:
-        """Detects stop lines in the road area."""
+    def detect(
+        self,
+        frame: np.ndarray,
+        gray: np.ndarray,
+        edges: np.ndarray,
+        crosswalk_boxes: Optional[List[Tuple[int, int, int, int]]] = None,
+    ) -> RoadMarkingResult:
+        """Detects stop lines in the road area, excluding lane-owned crosswalk boxes."""
         if not self.enabled:
             return RoadMarkingResult()
 
@@ -39,7 +45,9 @@ class RoadMarkingDetector:
         # Restrict markings analysis to the road area
         mask = np.zeros_like(gray)
         cv2.fillPoly(mask, roi_corners, 255)
-        stopline_detected, stopline_boxes, stopline_y = self._detect_stopline(edges, mask, w, h)
+        stopline_detected, stopline_boxes, stopline_y = self._detect_stopline(
+            edges, mask, w, h, crosswalk_boxes=crosswalk_boxes
+        )
 
         return RoadMarkingResult(
             stopline_detected=stopline_detected,
@@ -53,10 +61,31 @@ class RoadMarkingDetector:
         edges: np.ndarray,
         roi_mask: np.ndarray,
         w: int,
-        h: int
+        h: int,
+        crosswalk_boxes: Optional[List[Tuple[int, int, int, int]]] = None,
     ) -> Tuple[bool, List[Tuple[int, int, int, int]], Optional[float]]:
         """Detects wide horizontal line segments characteristic of road stop lines."""
         masked_edges = cv2.bitwise_and(edges, roi_mask)
+
+        # If the lane module confirms a crosswalk, stale stop-line state is also invalid.
+        if crosswalk_boxes:
+            self.stopline_history.clear()
+            self.stopline_box_history.clear()
+            self.last_stopline_y = None
+            self.last_stopline_box = None
+            self.stopline_missing_frames = 0
+            return False, [], None
+
+        # The lane module owns crosswalk detection. Remove those horizontal bands
+        # before Hough so zebra crossings cannot masquerade as stop lines.
+        for bx1, by1, bx2, by2 in crosswalk_boxes or []:
+            pad = max(4, int(h * 0.012))
+            y1 = max(0, int(by1) - pad)
+            y2 = min(h, int(by2) + pad)
+            bx1 = max(0, int(bx1))
+            bx2 = min(w, int(bx2))
+            masked_edges[y1:y2, bx1:bx2] = 0
+
         # Focus on lower half of road ROI (near ego vehicle)
         roi_bottom_y = int(h * 0.88)
         roi_mid_y = int(h * 0.70)

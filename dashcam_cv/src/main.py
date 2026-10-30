@@ -90,11 +90,14 @@ class LanesDetectorV1EMAdapter:
         left_fit = line_to_fit(left_line.tolist() if hasattr(left_line, "tolist") else left_line)
         right_fit = line_to_fit(right_line.tolist() if hasattr(right_line, "tolist") else right_line)
         is_crosswalk = bool(self.crosswalk_detector.is_crosswalk)
+        cw_boxes = []
+        if is_crosswalk:
+            cw_boxes = [(int(w * 0.15), int(h * 0.65), int(w * 0.85), int(h * 0.88))]
 
         debug_info = {
             "confidence": 0.7 if status == "TRACKING" else (0.45 if left_fit is not None or right_fit is not None else 0.0),
             "is_crosswalk": is_crosswalk,
-            "cw_boxes": [],
+            "cw_boxes": cw_boxes,
             "held_left": left_fit is not None and "HOLD" in status,
             "held_right": right_fit is not None and "HOLD" in status,
             "combined_edges": None,
@@ -265,9 +268,14 @@ def run_pipeline(cfg: dict, args: argparse.Namespace):
 
             # Road Markings (Crosswalks and Stop lines)
             t0 = time.perf_counter()
-            markings_res = road_markings.detect(frame, enhanced, edges)
             # 횡단보도는 선택된 차선 모듈이 담당하며, 노면 모듈은 정지선만 담당합니다.
             lane_cw_boxes = lane_debug.get("cw_boxes", []) if is_crosswalk else []
+            markings_res = road_markings.detect(
+                frame,
+                enhanced,
+                edges,
+                crosswalk_boxes=lane_cw_boxes,
+            )
             markings_res.crosswalk_detected = bool(is_crosswalk)
             markings_res.crosswalk_boxes = lane_cw_boxes
             t_markings = (time.perf_counter() - t0) * 1000.0
