@@ -41,7 +41,10 @@ roi:
 
 # 5. 차선 검출 및 추적 설정 (cv1021.py Canny + 허프 maxLineGap 60 + 4D Kalman Filter)
 lane:
-  detector: "lane_line"     # lane_line 또는 lanes_detector_v1_em
+  detector: "lanes_detector_v1_em"     # lane_line 또는 lanes_detector_v1_em
+  undistort: false                     # true: 왜곡 보정 ON / false: RAW 입력 그대로 (OFF)
+  calib_file: "config/camera_calib.npz"  # 캘리브레이션 파라미터 파일 (.npz)
+  undistort_fov_deg: 115               # 내장 대시캠 모델 FOV (캘리브레이션 파일 없을 때 사용)
   hough_threshold: 25       # 허프 변환 임계값 (cv1021.py)
   min_line_length: 20       # 최소 선분 길이 (cv1021.py)
   max_line_gap: 60          # 끊어진 선분 연결 최대 간격 (cv1021.py)
