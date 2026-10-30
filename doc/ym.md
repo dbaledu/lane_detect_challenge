@@ -539,6 +539,7 @@ IoU는 Intersection over Union의 약자이며, 두 바운딩 박스가 얼마�
 |`render`|1.19ms|결과를 프레임 위에 그리는 시각화|
 
 평균 총 처리시간 `21.61ms`를 FPS로 환산하면 약 **46.3 FPS**이므로, `effective_processing_fps`와 거의 일치합니다. 모듈별 평균을 더하면 약 **20.53ms**로 총 시간보다 조금 짧은데, 측정 범위에 차이가 있거나 모듈별 시간에 포함되지 않는 오버헤드가 있을 수 있습니다.
+<<<<<<< HEAD
 
 
 ## 성능 분석 후 개선
@@ -1191,3 +1192,5 @@ DrivingStateResult
 FrameTimings
   성능 측정 인터페이스
 ```
+=======
+>>>>>>> 9b8acfc12dc480b3257e0fdfb0025f3272669fca
