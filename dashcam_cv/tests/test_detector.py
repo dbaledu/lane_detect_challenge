@@ -43,7 +43,6 @@ class TestDetectorModule(unittest.TestCase):
             },
             "road_markings": {
                 "enable": True,
-                "crosswalk_min_stripes": 3,
                 "stopline_min_width_ratio": 0.20,
                 "stopline_max_slope": 0.20
             },

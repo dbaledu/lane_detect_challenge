@@ -265,10 +265,8 @@ def run_pipeline(cfg: dict, args: argparse.Namespace):
 
             # Road Markings (Crosswalks and Stop lines)
             t0 = time.perf_counter()
-            markings_res = road_markings.detect(
-                frame, enhanced, edges, detect_crosswalk=False
-            )
-            # Selected lane detector owns crosswalk detection; road-markings owns stop lines.
+            markings_res = road_markings.detect(frame, enhanced, edges)
+            # 횡단보도는 선택된 차선 모듈이 담당하며, 노면 모듈은 정지선만 담당합니다.
             lane_cw_boxes = lane_debug.get("cw_boxes", []) if is_crosswalk else []
             markings_res.crosswalk_detected = bool(is_crosswalk)
             markings_res.crosswalk_boxes = lane_cw_boxes
@@ -282,7 +280,7 @@ def run_pipeline(cfg: dict, args: argparse.Namespace):
             # Object Tracking
             t0 = time.perf_counter()
             tracked_objects = object_tracker.update(
-                raw_objects, det_updated, lane_res, frame.shape, markings_res
+                raw_objects, det_updated, lane_res, frame.shape
             )
             t_tracking = (time.perf_counter() - t0) * 1000.0
 

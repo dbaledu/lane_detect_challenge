@@ -72,7 +72,6 @@ class ObjectBox:
     center: Tuple[float, float]
     velocity: Tuple[float, float] = (0.0, 0.0)
     is_lead: bool = False
-    is_on_crosswalk: bool = False
     relative_distance_trend: str = "UNKNOWN"  # APPROACHING, RECEDING, STABLE, UNKNOWN
     status: str = "UNKNOWN"                  # MOVING, STOPPED, UNKNOWN
 
@@ -83,7 +82,6 @@ class ObjectBox:
             "label": self.label,
             "confidence": round(self.confidence, 2),
             "is_lead": self.is_lead,
-            "is_on_crosswalk": self.is_on_crosswalk,
             "status": self.status,
             "distance_trend": self.relative_distance_trend,
         }

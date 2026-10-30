@@ -67,8 +67,7 @@ class ObjectTracker:
         detections: List[ObjectBox],
         detection_executed: bool,
         lane: Optional[LaneResult],
-        frame_shape: Tuple[int, int, int],
-        road_markings: Optional[Any] = None
+        frame_shape: Tuple[int, int, int]
     ) -> List[ObjectBox]:
         """Matches detections to existing tracks and computes dynamics."""
         h, w = frame_shape[:2]
@@ -181,16 +180,5 @@ class ObjectTracker:
             for obj in active_objects:
                 if obj.track_id == lead_candidate_id:
                     obj.is_lead = True
-
-        # Mark pedestrians situated on/near detected crosswalks
-        if road_markings and road_markings.crosswalk_detected:
-            for obj in active_objects:
-                if obj.label == "person":
-                    ox1, oy1, ox2, oy2 = obj.bbox
-                    for cx1, cy1, cx2, cy2 in road_markings.crosswalk_boxes:
-                        # Check horizontal and vertical bounding overlap
-                        if (ox2 >= cx1 - 15 and ox1 <= cx2 + 15) and (oy2 >= cy1 - 30 and oy1 <= cy2 + 30):
-                            obj.is_on_crosswalk = True
-                            break
 
         return active_objects

@@ -1,26 +1,35 @@
-"""Road markings detection module for crosswalks and stop lines."""
+"""Road markings detection module for stop lines."""
 import cv2
 import numpy as np
 from typing import List, Tuple, Dict, Any, Optional
+from collections import deque
 from ..common.data_models import RoadMarkingResult
 from ..common.geometry import get_roi_polygon, compute_slope
 
 
 class RoadMarkingDetector:
-    """Detects crosswalk zebra stripes and horizontal stop lines using computer vision."""
+    """Detects horizontal stop lines using computer vision."""
 
     def __init__(self, cfg: Optional[Dict[str, Any]] = None):
         self.cfg = cfg or {}
         rm_cfg = self.cfg.get("road_markings", {})
 
         self.enabled = rm_cfg.get("enable", True)
-        self.min_stripes = int(rm_cfg.get("crosswalk_min_stripes", 3))
         self.stopline_min_width_ratio = float(rm_cfg.get("stopline_min_width_ratio", 0.25))
         self.stopline_max_slope = float(rm_cfg.get("stopline_max_slope", 0.20))
+        self.stopline_max_jump_ratio = float(rm_cfg.get("stopline_max_jump_ratio", 0.035))
+        self.stopline_smooth_frames = max(1, int(rm_cfg.get("stopline_smooth_frames", 5)))
+        self.stopline_hold_frames = max(0, int(rm_cfg.get("stopline_hold_frames", 4)))
+        self.stopline_max_x_jump_ratio = float(rm_cfg.get("stopline_max_x_jump_ratio", 0.08))
+        self.stopline_box_history: deque = deque(maxlen=self.stopline_smooth_frames)
 
-    def detect(self, frame: np.ndarray, gray: np.ndarray, edges: np.ndarray,
-               detect_crosswalk: bool = True) -> RoadMarkingResult:
-        """Detects crosswalks and stop lines in the road area."""
+        self.stopline_history: deque = deque(maxlen=self.stopline_smooth_frames)
+        self.last_stopline_y: Optional[float] = None
+        self.last_stopline_box: Optional[Tuple[int, int, int, int]] = None
+        self.stopline_missing_frames = 0
+
+    def detect(self, frame: np.ndarray, gray: np.ndarray, edges: np.ndarray) -> RoadMarkingResult:
+        """Detects stop lines in the road area."""
         if not self.enabled:
             return RoadMarkingResult()
 
@@ -30,56 +39,14 @@ class RoadMarkingDetector:
         # Restrict markings analysis to the road area
         mask = np.zeros_like(gray)
         cv2.fillPoly(mask, roi_corners, 255)
-        road_gray = cv2.bitwise_and(gray, mask)
-
-        if detect_crosswalk:
-            crosswalk_detected, crosswalk_boxes = self._detect_crosswalk(road_gray, w, h)
-        else:
-            crosswalk_detected, crosswalk_boxes = False, []
         stopline_detected, stopline_boxes, stopline_y = self._detect_stopline(edges, mask, w, h)
 
         return RoadMarkingResult(
-            crosswalk_detected=crosswalk_detected,
-            crosswalk_boxes=crosswalk_boxes,
             stopline_detected=stopline_detected,
             stopline_boxes=stopline_boxes,
             stopline_y=stopline_y
         )
 
-    def _detect_crosswalk(self, road_gray: np.ndarray, w: int, h: int) -> Tuple[bool, List[Tuple[int, int, int, int]]]:
-        """Detects zebra crosswalk pattern via thresholding and spatial clustering."""
-        # Focus on bright markings in road
-        _, thresh = cv2.threshold(road_gray, 180, 255, cv2.THRESH_BINARY)
-        # Use a horizontal structuring element to emphasize zebra stripes
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (12, 3))
-        filtered = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
-
-        contours, _ = cv2.findContours(filtered, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        stripe_boxes = []
-        for cnt in contours:
-            area = cv2.contourArea(cnt)
-            if area < 150 or area > 15000:
-                continue
-            x, y, rw, rh = cv2.boundingRect(cnt)
-            aspect = rw / float(rh)
-            # Zebra stripe candidate: wider than tall
-            if 1.5 <= aspect <= 12.0 and rw > 20:
-                stripe_boxes.append((x, y, x + rw, y + rh))
-
-        if len(stripe_boxes) >= self.min_stripes:
-            # Cluster stripe boxes that are vertically close
-            stripe_boxes.sort(key=lambda b: b[1])
-            min_x = min(b[0] for b in stripe_boxes)
-            min_y = min(b[1] for b in stripe_boxes)
-            max_x = max(b[2] for b in stripe_boxes)
-            max_y = max(b[3] for b in stripe_boxes)
-
-            # Combined bounding box enclosing the crosswalk
-            cluster_box = (min_x, min_y, max_x, max_y)
-            return True, [cluster_box]
-
-        return False, []
 
     def _detect_stopline(
         self,
@@ -104,29 +71,85 @@ class RoadMarkingDetector:
         )
 
         if lines is None:
-            return False, [], None
+            return self._hold_last_stopline()
 
-        candidate_boxes = []
-        found_y = None
-
+        candidates = []
         for line in lines:
             x1, y1, x2, y2 = line.flatten()
             actual_y1 = roi_mid_y + y1
             actual_y2 = roi_mid_y + y2
             slope = compute_slope(x1, actual_y1, x2, actual_y2)
 
-            if slope is not None and abs(slope) <= self.stopline_max_slope:
-                line_w = abs(x2 - x1)
-                if line_w >= (w * self.stopline_min_width_ratio):
-                    bx1 = min(x1, x2)
-                    bx2 = max(x1, x2)
-                    by1 = min(actual_y1, actual_y2) - 4
-                    by2 = max(actual_y1, actual_y2) + 4
-                    candidate_boxes.append((bx1, by1, bx2, by2))
-                    found_y = (actual_y1 + actual_y2) / 2.0
-                    break
+            if slope is None or abs(slope) > self.stopline_max_slope:
+                continue
 
-        if candidate_boxes:
-            return True, candidate_boxes, found_y
+            line_w = abs(x2 - x1)
+            if line_w < (w * self.stopline_min_width_ratio):
+                continue
 
-        return False, [], None
+            found_y = float((actual_y1 + actual_y2) / 2.0)
+            bx1 = min(x1, x2)
+            bx2 = max(x1, x2)
+            box = (bx1, int(found_y - 4), bx2, int(found_y + 4))
+            candidates.append((found_y, box, float(line_w)))
+
+        if not candidates:
+            return self._hold_last_stopline()
+
+        max_y_jump = max(12, int(h * self.stopline_max_jump_ratio))
+        max_x_jump = max(16, int(w * self.stopline_max_x_jump_ratio))
+        if self.last_stopline_y is not None and self.last_stopline_box is not None:
+            last_center_x = (self.last_stopline_box[0] + self.last_stopline_box[2]) / 2.0
+            usable = []
+            for c in candidates:
+                found_y_candidate, candidate_box, _ = c
+                candidate_center_x = (candidate_box[0] + candidate_box[2]) / 2.0
+                if (abs(found_y_candidate - self.last_stopline_y) <= max_y_jump and
+                        abs(candidate_center_x - last_center_x) <= max_x_jump):
+                    usable.append(c)
+            if not usable:
+                return self._hold_last_stopline()
+        else:
+            usable = candidates
+
+        found_y, box, _ = min(
+            usable,
+            key=lambda c: (
+                abs(c[0] - self.last_stopline_y) if self.last_stopline_y is not None else 0.0,
+                abs((c[1][0] + c[1][2]) / 2.0 - last_center_x)
+                if self.last_stopline_y is not None and self.last_stopline_box is not None else 0.0,
+                -c[2],
+            ),
+        )
+
+        self.stopline_history.append(found_y)
+        self.stopline_box_history.append((float(box[0]), float(box[2])))
+
+        smooth_y = float(np.median(np.asarray(self.stopline_history, dtype=np.float32)))
+        box_x_values = np.asarray(self.stopline_box_history, dtype=np.float32)
+        smooth_x1 = int(round(float(np.median(box_x_values[:, 0]))))
+        smooth_x2 = int(round(float(np.median(box_x_values[:, 1]))))
+        if smooth_x2 <= smooth_x1:
+            smooth_x1, smooth_x2 = box[0], box[2]
+
+        smooth_box = (smooth_x1, int(round(smooth_y - 4)), smooth_x2, int(round(smooth_y + 4)))
+
+        self.last_stopline_y = smooth_y
+        self.last_stopline_box = smooth_box
+        self.stopline_missing_frames = 0
+        return True, [smooth_box], smooth_y
+
+    def _hold_last_stopline(self) -> Tuple[bool, List[Tuple[int, int, int, int]], Optional[float]]:
+        if self.last_stopline_y is None or self.last_stopline_box is None:
+            return False, [], None
+
+        if self.stopline_missing_frames >= self.stopline_hold_frames:
+            self.stopline_history.clear()
+            self.stopline_box_history.clear()
+            self.last_stopline_y = None
+            self.last_stopline_box = None
+            self.stopline_missing_frames = 0
+            return False, [], None
+
+        self.stopline_missing_frames += 1
+        return True, [self.last_stopline_box], self.last_stopline_y

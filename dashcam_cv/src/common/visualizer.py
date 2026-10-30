@@ -151,11 +151,7 @@ class HUDVisualizer:
         if self.show_objects:
             for obj in objects:
                 x1, y1, x2, y2 = obj.bbox
-                if obj.is_on_crosswalk:
-                    box_color = (0, 69, 255)  # High-visibility Red-Orange for pedestrians on crosswalk
-                    box_thickness = 3
-                    tag = f"CROSSWALK PED #{obj.track_id} {obj.confidence:.2f}"
-                elif obj.is_lead:
+                if obj.is_lead:
                     box_color = (0, 0, 255)  # Red for lead vehicle
                     box_thickness = 3
                     tag = f"LEAD CAR #{obj.track_id} [{obj.status}|{obj.relative_distance_trend}]"
@@ -216,11 +212,12 @@ class HUDVisualizer:
                         cv2.FONT_HERSHEY_DUPLEX, 0.55, (240, 240, 240), 1, cv2.LINE_AA)
             cv2.line(vis, (card_x + 10, card_y + 28), (card_x + card_w - 10, card_y + 28), (80, 80, 80), 1)
 
+            # 10월 30일 좌측 대시보드에 프레임 정보는 안보이게 변경 by 김유미
             # Frame & Timestamp & FPS
-            eff_fps = (1000.0 / timings.total_ms) if timings.total_ms > 0 else 0.0
-            info_str = f"F#{frame_idx:04d} | {timestamp_sec:.2f}s | {eff_fps:4.1f} FPS ({timings.total_ms:4.1f}ms)"
-            cv2.putText(vis, info_str, (card_x + 12, card_y + 46),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1, cv2.LINE_AA)
+            # eff_fps = (1000.0 / timings.total_ms) if timings.total_ms > 0 else 0.0
+            # info_str = f"F#{frame_idx:04d} | {timestamp_sec:.2f}s | {eff_fps:4.1f} FPS ({timings.total_ms:4.1f}ms)"
+            # cv2.putText(vis, info_str, (card_x + 12, card_y + 46),
+            #             cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1, cv2.LINE_AA)
 
             # Lead Vehicle State & Traffic Light
             lead_color = (255, 100, 100) if state.lead_state in ("STOPPED", "APPROACHING") else (180, 220, 180)

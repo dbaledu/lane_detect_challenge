@@ -88,6 +88,47 @@ lanes_detector_v1_EM.py
 - 우측 Hough 선분들을 위치별 후보로 나누고, 좌측 차선도 검출된 경우 차로 폭이 타당한 후보 중 화면 중앙에 가까운 것을 선택
 
 
+#### 횡단보도 검출
+
+두 방식은 **같은 횡단보도를 찾지만, 검출 방식과 결과의 쓰임새가 다릅니다.**
+
+|비교 항목|`RoadMarkingDetector._detect_crosswalk()`|`detector.py`의 `SubDetector` 횡단보도 검출|
+|---|---|---|
+|방식|OpenCV 영상 처리 규칙|횡단보도 데이터로 학습된 YOLO 모델|
+|처리 과정|도로 ROI에서 밝은 픽셀을 추출하고, 가로 줄무늬 후보를 찾아 최소 개수 이상이면 하나의 영역으로 묶음|별도 모델이 횡단보도 객체의 박스와 confidence를 예측|
+|장점|가볍고 별도 모델 파일이 필요 없음. 조건이 맞는 노면 표시를 빠르게 찾음|일부 가림이나 패턴 변화에도 학습된 특징을 이용해 찾을 가능성이 있음|
+|약점|밝기·그림자·노면 상태·시점에 영향을 받음. 횡단보도와 비슷한 흰 줄무늬도 오인할 수 있음|모델의 학습 데이터와 정확도에 좌우됨. 모델 로딩·메모리·추론 비용이 추가됨|
+|현재 기본 설정|활성화|**비활성화** (`enable_crosswalk`의 기본값이 `False`)|
+
+OpenCV 방식은 `road_markings.py의 _detect_crosswalk()`에서 밝기 임계값 180, 가로 형태 필터, 윤곽선의 크기·가로세로 비율을 확인합니다. 줄무늬 후보가 설정된 최소 개수 이상이면 전체를 감싸는 박스 하나를 반환합니다.
+
+YOLO 방식은 `detector.py의 횡단보도 모델 초기화`에서 별도 모델을 추가하고, 찾은 클래스를 내부 ID `100`으로 매핑합니다. 다만 현재 `settings.yaml`에는 `enable_crosswalk: true`가 설정되어 있지 않으므로 실행 시 이 추가 모델은 기본적으로 사용되지 않습니다.
+
+##### 횡단보도 검출 다른 방법
+
+방식 1. 엣지 교번 빈도 검출  
+![alt text](images/crosswalk.png)
+
+방식 2. 이진화·윤곽선 검출  
+![alt text](images/crosswalk01.png)
+
+
+방식1은 속도우선  
+방식2는 위치정보(박스) 표시. 문제점은 후보 개수만 확인할 뿐 실제로 후보들이 서로 가까이 있는지, 비슷한 방향으로 정렬되어 있는지는 확인하지 않습니다. 따라서 멀리 떨어진 밝은 영역까지 하나의 큰 사각형으로 묶을 수 있습니다.  
+
+
+#### 정지선 검출 시 튀는 현상 수정
+
+- 이전 프레임의 stopline_y와 거리가 먼 Hough 후보는 무시
+- 최근 5프레임의 중앙값으로 Y 위치 평활화
+- 후보가 잠깐 검출되지 않아도 마지막 위치를 최대 4프레임 유지
+- 후보가 4프레임 이상 없으면 확실히 미검출로 초기화
+
+> 개선 후 좌우로 틔는 현상이 있음
+
+좌우 흔들림은 Y축 평활화만으로는 해결되지 않으며, 매 프레임 Hough 선분의 x1/x2와 길이가 서로 달라 박스 폭까지 바뀌기 때문입니다. 후보마다 이전 박스 중심과 폭을 비교하고 좌우 좌표도 별도로 중앙값 평활화하겠습니다.
+
+
 #### 수도코드(cv1021.py)
 ```
 시작:
@@ -227,36 +268,6 @@ detect(frame, frame_idx)를 호출한다
 후보 객체 목록을 반환한다
 ```
 여기서 detect()의 두 번째 반환값은 새 추론을 이번 프레임에서 실제 실행했는지 나타냅니다. 검출 간격 사이 프레임에서는 이전 캐시 결과를 반환하며, 호출부인 main.py는 이 값과 객체 목록을 추적기에 전달합니다.
-
-
-#### 횡단보도 검출
-
-두 방식은 **같은 횡단보도를 찾지만, 검출 방식과 결과의 쓰임새가 다릅니다.**
-
-|비교 항목|`RoadMarkingDetector._detect_crosswalk()`|`detector.py`의 `SubDetector` 횡단보도 검출|
-|---|---|---|
-|방식|OpenCV 영상 처리 규칙|횡단보도 데이터로 학습된 YOLO 모델|
-|처리 과정|도로 ROI에서 밝은 픽셀을 추출하고, 가로 줄무늬 후보를 찾아 최소 개수 이상이면 하나의 영역으로 묶음|별도 모델이 횡단보도 객체의 박스와 confidence를 예측|
-|장점|가볍고 별도 모델 파일이 필요 없음. 조건이 맞는 노면 표시를 빠르게 찾음|일부 가림이나 패턴 변화에도 학습된 특징을 이용해 찾을 가능성이 있음|
-|약점|밝기·그림자·노면 상태·시점에 영향을 받음. 횡단보도와 비슷한 흰 줄무늬도 오인할 수 있음|모델의 학습 데이터와 정확도에 좌우됨. 모델 로딩·메모리·추론 비용이 추가됨|
-|현재 기본 설정|활성화|**비활성화** (`enable_crosswalk`의 기본값이 `False`)|
-
-OpenCV 방식은 `road_markings.py의 _detect_crosswalk()`에서 밝기 임계값 180, 가로 형태 필터, 윤곽선의 크기·가로세로 비율을 확인합니다. 줄무늬 후보가 설정된 최소 개수 이상이면 전체를 감싸는 박스 하나를 반환합니다.
-
-YOLO 방식은 `detector.py의 횡단보도 모델 초기화`에서 별도 모델을 추가하고, 찾은 클래스를 내부 ID `100`으로 매핑합니다. 다만 현재 `settings.yaml`에는 `enable_crosswalk: true`가 설정되어 있지 않으므로 실행 시 이 추가 모델은 기본적으로 사용되지 않습니다.
-
-##### 횡단보도 검출 다른 방법
-
-방식 1. 엣지 교번 빈도 검출  
-![alt text](images/crosswalk.png)
-
-방식 2. 이진화·윤곽선 검출  
-![alt text](images/crosswalk01.png)
-
-
-방식1은 속도우선  
-방식2는 위치정보(박스) 표시. 문제점은 후보 개수만 확인할 뿐 실제로 후보들이 서로 가까이 있는지, 비슷한 방향으로 정렬되어 있는지는 확인하지 않습니다. 따라서 멀리 떨어진 밝은 영역까지 하나의 큰 사각형으로 묶을 수 있습니다.  
-
 
 
 
@@ -568,3 +579,615 @@ EM 내부에서도 이미 frame.copy()와 overlay 복사가 있으므로 중복 
 추가 확인 필요 항목
 decision_fusion.py의 신호등 fallback은 YOLO가 차단하지 않았을 때만 실행되는지 재검증해야 합니다. YOLO가 박스를 찾았지만 색 분류에 실패한 경우 fallback이 막히면 과거 요청과 충돌합니다.
 
+
+## 함수 인터페이스
+
+## 전체 호출 흐름
+
+```mermaid
+flowchart TD
+    A[main] --> B[parse_args]
+    B --> C[load_config]
+    C --> D[run_pipeline]
+
+    D --> E[load_lane_detector]
+    E --> F[LaneDetector / Adapter 선택]
+
+    D --> G[VideoReader.frames]
+    G --> H[FramePreprocessor.process]
+    H --> I[QualityAnalyzer.analyze]
+
+    I --> J[Lane Detector.detect]
+    J --> K[LaneTracker.update]
+    K --> L[LaneChangeDetector.update]
+
+    L --> M[RoadMarkingDetector.detect]
+    M --> N[ObjectDetector.detect]
+    N --> O[ObjectTracker.update]
+    O --> P[MotionEstimator.estimate]
+    P --> Q[DecisionFusion.evaluate]
+
+    Q --> R[HUDVisualizer.draw]
+    R --> S[Lane draw_lane_hud]
+    S --> T[AnnotatedVideoWriter.write]
+    T --> U[CSVLogger.log]
+    U --> V[MetricsCollector.record]
+```
+
+---
+
+## 1. 프로그램 시작
+
+### `main()`
+
+`main.py`
+
+```python
+main() -> None
+```
+
+```text
+parse_args()
+  → 설정 파일 경로, 입력 영상, 출력, 차선 모듈 등 읽기
+  ↓
+load_config()
+  → dict 설정 반환
+  ↓
+run_pipeline(config, args)
+```
+
+### `load_config(config_path)`
+
+```python
+입력: str config_path
+반환: dict
+```
+
+---
+
+## 2. 프레임 읽기
+
+### `VideoReader.frames(max_frames=0)`
+
+`video_reader.py`
+
+```python
+입력: max_frames: int
+반환: Generator[
+    (ok: bool, frame: np.ndarray | None, frame_idx: int, timestamp: float)
+]
+```
+
+`frame`은 BGR 형식의 `np.ndarray`, shape은 `(H, W, 3)`입니다.
+
+---
+
+## 3. 전처리
+
+### `FramePreprocessor.process(frame, roi_mask=None)`
+
+`preprocessing.py`
+
+```python
+입력:
+    frame: np.ndarray
+    roi_mask: np.ndarray | None
+
+반환:
+    gray: np.ndarray       # 흑백 영상
+    enhanced: np.ndarray   # CLAHE 영상 또는 gray
+    edges: np.ndarray      # Canny edge 영상
+```
+
+세 값은 같은 `(H, W)` 크기의 단일 채널 이미지입니다.
+
+### `QualityAnalyzer.analyze(frame, gray=None)`
+
+`quality_analyzer.py`
+
+```python
+입력: frame: np.ndarray, gray: np.ndarray | None
+반환: QualityMetric
+```
+
+`QualityMetric`에는 평균 밝기, 야간 여부, 블러 점수 등이 포함됩니다.
+
+---
+
+## 4. 차선 검출 모듈 선택
+
+### `load_lane_detector(cfg)`
+
+`main.py`
+
+```python
+입력: cfg: dict
+반환: (
+    lane_detector 객체,
+    lane_module 또는 None,
+    lane_detector_name: str
+)
+```
+
+| 설정 | 검출 객체 | lane module | 이름 |
+|---|---|---|---|
+| `lane_line` | `HighStabilityLaneTracker` | lane line.py | `lane_line` |
+| `lanes_detector_v1_em` | `LanesDetectorV1EMAdapter` | EM module | `lanes_detector_v1_em` |
+
+---
+
+## 5. 차선 검출 공통 인터페이스
+
+두 검출기가 반환하는 공통 형식은 다음과 같습니다.
+
+```python
+(
+    left_fit: [m, c] | None,
+    right_fit: [m, c] | None,
+    is_crosswalk: bool,
+    debug_info: dict,
+)
+```
+
+여기서 피팅값은 이미지 좌표계의 직선식입니다.
+
+```text
+x = m * y + c
+```
+
+---
+
+## 5-1. `lane_line` 차선 검출
+
+`HighStabilityLaneTracker.detect(frame)`는 `lane line.py`에 있습니다.
+
+```python
+입력:
+    frame: np.ndarray
+
+반환:
+    left_fit: [m, c] | None
+    right_fit: [m, c] | None
+    is_crosswalk: bool
+    debug_info: dict
+```
+
+`debug_info` 주요 값:
+
+```python
+{
+    "left_corners": np.ndarray | None,
+    "right_corners": np.ndarray | None,
+    "left_bbox": (x1, y1, x2, y2) | None,
+    "right_bbox": (x1, y1, x2, y2) | None,
+    "cw_boxes": list,
+    "combined_edges": np.ndarray | None,
+    "confidence": float,
+    "held_left": bool,
+    "held_right": bool,
+}
+```
+
+---
+
+## 5-2. EM 차선 검출
+
+EM 어댑터의 입력 인터페이스는 `main.py`에 있습니다.
+
+```python
+detect(
+    frame,
+    gray=None,
+    enhanced=None,
+    edges=None,
+)
+```
+
+| 입력 | 형식 |
+|---|---|
+| `frame` | 현재 BGR 프레임 |
+| `gray` | 메인 전처리기의 grayscale 영상 |
+| `enhanced` | CLAHE 또는 grayscale 영상 |
+| `edges` | 메인 전처리기의 Canny 영상 |
+
+반환 형식은 `lane_line`과 동일합니다.
+
+### EM 내부 `process_frame()`
+
+`lanes_detector_v1_EM.py`
+
+```python
+입력:
+    frame: np.ndarray
+    tracker: ADASLaneTrackerV3
+    crosswalk_detector: CrosswalkAndMotionDetector
+    clahe: cv2.CLAHE
+    prev_gray_roi: np.ndarray | None
+    calibrator: object | None
+    gray: np.ndarray | None
+    enhanced: np.ndarray | None
+    edge_map: np.ndarray | None
+
+반환:
+    frame: np.ndarray
+    status: str
+    gray_roi: np.ndarray
+```
+
+EM 차선 상태 예시는 다음과 같습니다.
+
+```text
+TRACKING
+PARTIAL_LEFT
+PARTIAL_RIGHT
+HOLD (N/35)
+LOST
+DETECTING
+CROSSWALK_PAUSE
+```
+
+`frame`은 검출 전용 모드에서도 그대로 반환되며 차선 그래픽을 직접 그리지 않습니다.
+
+---
+
+## 6. 공통 차선 추적
+
+### `LaneTracker.update(...)`
+
+`lane_tracker.py`
+
+```python
+입력:
+    curr_left_fit: [m, c] | None
+    curr_right_fit: [m, c] | None
+    raw_confidence: float
+    w: int
+    h: int
+    is_crosswalk: bool
+    debug_info: dict | None
+
+반환:
+    LaneResult
+```
+
+`LaneResult`는 좌우 피팅값, 차선 중심, 차선 폭, 상태, 횡단보도 여부 등을 담습니다.
+
+주요 상태:
+
+```text
+BOTH_DETECTED
+LEFT_ONLY
+RIGHT_ONLY
+TEMPORARY_LOST
+LOST
+CROSSWALK_DETECTED
+```
+
+### `LaneChangeDetector.update(lane)`
+
+`lane_change.py`
+
+```python
+입력: LaneResult
+반환: str
+```
+
+반환값:
+
+```text
+KEEPING
+CANDIDATE
+IN_PROGRESS
+COMPLETE
+```
+
+---
+
+## 7. 도로 마킹 검출
+
+### `RoadMarkingDetector.detect(...)`
+
+`road_markings.py`
+
+```python
+입력:
+    frame: np.ndarray
+    gray: np.ndarray
+    edges: np.ndarray
+    detect_crosswalk: bool
+
+반환:
+    RoadMarkingResult
+```
+
+현재 메인 파이프라인은 다음과 같이 호출합니다.
+
+```python
+road_markings.detect(
+    frame,
+    enhanced,
+    edges,
+    detect_crosswalk=False,
+)
+```
+
+따라서 일반 횡단보도 검출은 차선 모듈이 담당하고, 이 모듈은 정지선 검출을 주로 수행합니다. 차선 모듈의 횡단보도 결과는 메인에서 다음 필드를 덮어쓰므로 최종 값은 차선 모듈 기준입니다.
+
+```python
+markings_res.crosswalk_detected = is_crosswalk
+markings_res.crosswalk_boxes = lane_debug["cw_boxes"]
+```
+
+---
+
+## 8. 객체 검출과 추적
+
+### `ObjectDetector.detect(frame, frame_idx)`
+
+`detector.py`
+
+```python
+입력:
+    frame: np.ndarray
+    frame_idx: int
+
+반환:
+    detections: List[ObjectBox]
+    detection_executed: bool
+```
+
+`detect_interval=5`이면 5프레임마다 YOLO 추론을 실행합니다.
+
+추론을 실행하지 않은 프레임에는 캐시된 객체 목록이 반환됩니다.
+
+### `ObjectTracker.update(...)`
+
+`object_tracker.py`
+
+```python
+입력:
+    detections: List[ObjectBox]
+    detection_executed: bool
+    lane: LaneResult
+    frame_shape: (H, W, C)
+    road_markings: RoadMarkingResult | None
+
+반환:
+    List[ObjectBox]
+```
+
+`ObjectBox`는 객체 ID, BBox, 클래스, confidence, 속도, 선두 차량 여부 등을 포함합니다.
+
+검출이 실행되지 않은 프레임에서는 기존 트랙의 위치를 예측하여 유지합니다.
+
+---
+
+## 9. 배경 움직임 분석
+
+### `MotionEstimator.estimate(gray, detected_objects)`
+
+`motion_estimator.py`
+
+```python
+입력:
+    gray: np.ndarray
+    detected_objects: List[ObjectBox] | None
+
+반환:
+    MotionResult
+```
+
+`MotionResult`에는 다음 정보가 있습니다.
+
+```text
+magnitude
+median_dx
+median_dy
+tracked_points
+is_reliable
+```
+
+---
+
+## 10. 주행 상태 판단
+
+### `DecisionFusion.evaluate(...)`
+
+`decision_fusion.py`
+
+```python
+입력:
+    motion: MotionResult
+    quality: QualityMetric
+    lane: LaneResult
+    objects: List[ObjectBox]
+    markings: RoadMarkingResult
+    lane_change_status: str
+    frame_shape: (H, W, C)
+    frame: np.ndarray | None
+
+반환:
+    DrivingStateResult
+```
+
+`DrivingStateResult`는 다음 정보를 포함합니다.
+
+```text
+ego_state
+lead_state
+fusion_state
+reason
+confidence
+lane_change_status
+traffic_light
+```
+
+---
+
+## 11. 시각화
+
+### `HUDVisualizer.draw(...)`
+
+`visualizer.py`
+
+```python
+입력:
+    frame
+    frame_idx
+    timestamp_sec
+    lane: LaneResult
+    objects: List[ObjectBox]
+    markings: RoadMarkingResult
+    motion: MotionResult
+    state: DrivingStateResult
+    timings: FrameTimings
+    quality: QualityMetric
+    debug_edge_map: np.ndarray | None
+    lane_left_fit: [m, c] | None
+    lane_right_fit: [m, c] | None
+    lane_is_crosswalk: bool
+    lane_debug: dict | None
+
+반환:
+    np.ndarray  # 모든 HUD가 합성된 최종 BGR 프레임
+```
+
+### 차선 렌더링 인터페이스
+
+선택된 차선 모듈의 `draw_lane_hud()`가 호출됩니다.
+
+```python
+draw_lane_hud(
+    frame,
+    left_fit,
+    right_fit,
+    is_crosswalk,
+    debug_info,
+    fps=0.0,
+    show_roi_boxes=True,
+)
+```
+
+반환값은 차선 그래픽이 적용된 `np.ndarray`입니다.
+
+- `lane_line`: `lane line.py`
+- EM: `lanes_detector_v1_EM.py`
+
+현재 EM 모듈의 `process_frame()`은 검출만 하고, 실제 차선 도형은 visualizer의 `draw_lane_hud()`에서 출력됩니다.
+
+---
+
+## 12. 출력 단계
+
+### `AnnotatedVideoWriter.write(frame)`
+
+`video_writer.py`
+
+```python
+입력: np.ndarray
+반환: None
+```
+
+### `CSVLogger.log(...)`
+
+`csv_logger.py`
+
+```python
+입력:
+    frame_id
+    timestamp_sec
+    LaneResult
+    List[ObjectBox]
+    RoadMarkingResult
+    MotionResult
+    DrivingStateResult
+    FrameTimings
+
+반환:
+    None
+```
+
+프레임 로그와 처리 시간 로그 두 CSV 파일에 기록합니다.
+
+### `MetricsCollector.record(...)`
+
+`metrics.py`
+
+```python
+입력:
+    FrameTimings
+    LaneResult
+    DrivingStateResult
+    RoadMarkingResult
+    num_objects: int
+
+반환:
+    None
+```
+
+### `MetricsCollector.generate_summary()`
+
+`metrics.py`
+
+```python
+입력: 없음
+반환: dict
+```
+
+평균 FPS, 모듈별 처리 시간, 차선 검출률, 주행 상태 분포 등을 계산하고 `summary.json`에 저장합니다.
+
+---
+
+## 공통 프레임 데이터 흐름 요약
+
+```text
+BGR frame
+  ↓
+gray / enhanced / edges
+  ↓
+차선 검출값 [m, c]
+  ↓
+LaneTracker → LaneResult
+  ↓
+객체 검출 → ObjectBox[]
+  ↓
+Track → List[ObjectBox]
+  ↓
+MotionResult
+  ↓
+RoadMarkingResult
+  ↓
+DrivingStateResult
+  ↓
+HUDVisualizer
+  ↓
+최종 annotated frame
+```
+
+핵심 규칙은 `frame`, `fit`, `dataclass`별 역할입니다.
+
+```text
+frame
+  모든 영상/검출 처리의 기본 단위
+
+[m, c]
+  차선 검출 모듈과 LaneTracker 사이의 피팅 인터페이스
+
+LaneResult
+  차선 상태/중심선 등 판정 시스템의 인터페이스
+
+ObjectBox
+  객체 검출/추적 시스템의 인터페이스
+
+RoadMarkingResult
+  횡단보도/정지선 인터페이스
+
+MotionResult
+  움직임 분석 인터페이스
+
+DrivingStateResult
+  최종 주행 판단 인터페이스
+
+FrameTimings
+  성능 측정 인터페이스
+```
