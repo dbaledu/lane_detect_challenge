@@ -55,8 +55,8 @@ lane:
 
 # 6. 차선 변경 감지 설정
 lane_change:
-  drift_threshold_px: 55.0  # 차선 중심 편차 드리프트 임계값
-  candidate_frames: 4       # 변경 의심 진입 프레임수
+  drift_threshold_px: 60.0  # 차선 중심 편차 드리프트 임계값
+  candidate_frames: 5       # 변경 의심 진입 프레임수
   progress_frames: 10        # 변경 진행 판정 프레임수
 
 # 7. 객체 검출 모델 설정 (경량화 최적화)
