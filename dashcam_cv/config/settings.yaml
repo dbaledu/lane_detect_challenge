@@ -41,7 +41,7 @@ roi:
 
 # 5. 차선 검출 및 추적 설정 (cv1021.py Canny + 허프 maxLineGap 60 + 4D Kalman Filter)
 lane:
-  detector: "lane_line"     # lane_line 또는 lanes_detector_v1_em
+  detector: "lanes_detector_v1_em"     # lane_line 또는 lanes_detector_v1_em
   hough_threshold: 25       # 허프 변환 임계값 (cv1021.py)
   min_line_length: 20       # 최소 선분 길이 (cv1021.py)
   max_line_gap: 60          # 끊어진 선분 연결 최대 간격 (cv1021.py)
@@ -89,7 +89,7 @@ road_markings:
 # 10. 주행 상태 판단 설정 (광학 흐름 및 상태 머신)
 state:
   flow_max_features: 150    # 광학 흐름 추적 특징점 최대 개수
-  flow_stopped_threshold: 0.85 # 배경 광학 흐름 크기가 이 값 미만이면 정지 의심
+  flow_stopped_threshold: 0.35 # 배경 광학 흐름 크기가 이 값 미만이면 정지 의심
   flow_decel_slope: -0.04   # 시간 창 내 이동량 기울기가 음수일 때 감속 의심
   flow_start_threshold: 1.25 # 정지 후 재출발 판정 임계값
   window_size_frames: 25    # 상태 판별용 시계열 시간 창 (약 0.8초)
