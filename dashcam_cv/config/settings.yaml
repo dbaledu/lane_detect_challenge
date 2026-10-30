@@ -41,7 +41,7 @@ roi:
 
 # 5. 차선 검출 및 추적 설정 (cv1021.py Canny + 허프 maxLineGap 60 + 4D Kalman Filter)
 lane:
-  detector: "lane_line"     # lane_line 또는 lanes_detector_v1_em
+  detector: "lanes_detector_v1_em"     # lane_line 또는 lanes_detector_v1_em
   hough_threshold: 25       # 허프 변환 임계값 (cv1021.py)
   min_line_length: 20       # 최소 선분 길이 (cv1021.py)
   max_line_gap: 60          # 끊어진 선분 연결 최대 간격 (cv1021.py)
@@ -79,9 +79,12 @@ tracker:
 # 9. 횡단보도 및 정지선 검출 설정
 road_markings:
   enable: true
-  crosswalk_min_stripes: 3  # 최소 평행 줄무늬 개수
   stopline_min_width_ratio: 0.25 # 차로 대비 최소 수평선 폭 비율
   stopline_max_slope: 0.20  # 가로 수평선 최대 허용 기울기
+  stopline_max_jump_ratio: 0.035 # 이전 위치 대비 허용 최대 Y 이동비율
+  stopline_smooth_frames: 7 # 정지선 Y/좌우 좌표 중앙값 평활 프레임
+  stopline_hold_frames: 4 # 후보 검출 실패 시 마지막 위치 유지 프레임
+  stopline_max_x_jump_ratio: 0.08 # 이전 박스 중심 대비 허용 최대 좌우 이동비율
 
 # 10. 주행 상태 판단 설정 (광학 흐름 및 상태 머신)
 state:

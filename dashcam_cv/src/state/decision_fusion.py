@@ -166,7 +166,7 @@ class DecisionFusion:
         # Phase 2: [Fallback] Lightweight Contour & Housing Validation
         # (Executes only when YOLO detected no traffic lights; no heavy HoughCircles)
         # ====================================================================
-        if not detected_candidates and not tl_boxes:
+        if not detected_candidates:
             y_start = int(h * self.tl_roi_top)
             y_end = int(h * self.tl_roi_bottom)
             x_start = int(w * self.tl_roi_left)
@@ -350,13 +350,8 @@ class DecisionFusion:
         raw_state = "NORMAL"
         raw_reason = ego_reason
 
-        pedestrian_on_crosswalk = any(obj.label == "person" and obj.is_on_crosswalk for obj in objects)
-
-        # Hazard Priority 1: Pedestrian on crosswalk or near driving corridor
-        if pedestrian_on_crosswalk:
-            raw_state = "STOP_REQUIRED"
-            raw_reason = "횡단보도 위 보행자 감지 (즉시 정지 필요)"
-        elif pedestrians_near:
+        # Hazard Priority 1: Pedestrian near driving corridor
+        if pedestrians_near:
             raw_state = "STOP_REQUIRED"
             raw_reason = "전방 차로 내 근접 보행자 감지 (즉시 정지 필요)"
 

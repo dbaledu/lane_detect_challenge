@@ -20,10 +20,7 @@ COCO_CLASS_NAMES = {
     5: "bus",
     7: "truck",
     9: "traffic light",
-    100: "crosswalk",
 }
-
-CROSSWALK_ID = 100
 
 
 class _DropHalfWarning(logging.Filter):
@@ -144,12 +141,6 @@ class ObjectDetector:
         self.imgsz_gpu = int(det_cfg.get("imgsz_gpu", 640))
         self.imgsz_cpu = int(det_cfg.get("imgsz_cpu", 480))
 
-        # 횡단보도 전용 모델 설정 (선택)
-        self.enable_crosswalk = det_cfg.get("enable_crosswalk", False)
-        self.crosswalk_weight = det_cfg.get("crosswalk_weight", "hf://saifyxpro/Revpass")
-        self.crosswalk_class_name = det_cfg.get("crosswalk_class_name", "crosswalk").lower()
-        self.crosswalk_conf = float(det_cfg.get("crosswalk_conf", 0.25))
-
         self.detectors: List[SubDetector] = []
         self.enhancer: Optional[NightEnhancer] = None
         self.device = "cpu"
@@ -187,26 +178,7 @@ class ObjectDetector:
                 self.detectors.append(main_det)
                 print(f"[ObjectDetector] 메인 YOLO 모델 로드 성공: {self.model_name} (device={self.device}, imgsz={self.imgsz})")
 
-                # 2. 횡단보도 모델 (선택)
-                if self.enable_crosswalk:
-                    try:
-                        cw_det = SubDetector(
-                            weight=self.crosswalk_weight,
-                            device=self.device,
-                            imgsz=self.imgsz,
-                            classes=None,
-                            conf=self.crosswalk_conf,
-                        )
-                        cw_ids = [i for i, n in cw_det.names.items() if str(n).lower() == self.crosswalk_class_name]
-                        if cw_ids:
-                            cw_det.classes = cw_ids
-                            cw_det.id_map = {i: CROSSWALK_ID for i in cw_ids}
-                            self.detectors.append(cw_det)
-                            print(f"[ObjectDetector] 횡단보도 모델 활성화: 클래스 {cw_ids} -> 내부 ID {CROSSWALK_ID}")
-                    except Exception as e:
-                        print(f"[ObjectDetector] 횡단보도 모델 로드 건너뜀: {e}")
-
-                # 3. 야간 전처리기 생성
+                # 2. 야간 전처리기 생성
                 if self.enable_enhance:
                     self.enhancer = NightEnhancer()
 

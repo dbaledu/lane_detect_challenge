@@ -972,3 +972,4 @@ if __name__ == "__main__":
         cfg=custom_cfg,
         max_frames=args.max_frames
     )
+

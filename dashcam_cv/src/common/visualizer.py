@@ -58,13 +58,15 @@ class HUDVisualizer:
         """Composes all visual components onto the frame."""
         h, w = frame.shape[:2]
         vis = frame.copy()
-        overlay = frame.copy()
+        overlay = None
 
         roi_corners = get_roi_polygon(w, h, self.cfg.get("roi"))
 
         # 1. Draw Dual ROI Guidelines & Bounding Boxes (cv1021.py) or default ROI
         if self.show_lane_overlay and lane.left_corners is not None and lane.right_corners is not None:
             if not lane.is_crosswalk:
+                if overlay is None:
+                    overlay = vis.copy()
                 if self.show_bbox:
                     if lane.left_bbox is not None:
                         lx1, ly1, lx2, ly2 = lane.left_bbox
@@ -81,6 +83,8 @@ class HUDVisualizer:
                 cv2.polylines(overlay, [lane.left_corners], isClosed=True, color=(255, 200, 0), thickness=1)
                 cv2.polylines(overlay, [lane.right_corners], isClosed=True, color=(0, 200, 255), thickness=1)
         elif self.show_lane_overlay:
+            if overlay is None:
+                overlay = vis.copy()
             cv2.polylines(overlay, [roi_corners], isClosed=True, color=(70, 70, 70), thickness=1)
 
 
@@ -99,10 +103,13 @@ class HUDVisualizer:
             elif state.fusion_state == "STOP_REQUIRED":
                 corridor_color = (40, 40, 220)  # Red
 
+            if overlay is None:
+                overlay = vis.copy()
             cv2.fillPoly(overlay, corridor_pts, corridor_color)
 
-        # Alpha blend corridor overlay
-        vis = cv2.addWeighted(overlay, 0.30, vis, 0.70, 0)
+        # Alpha blend only when corridor/ROI geometry actually created an overlay.
+        if overlay is not None:
+            vis = cv2.addWeighted(overlay, 0.30, vis, 0.70, 0)
 
         # Draw Left/Right Lane lines on top of blend
         if self.show_lane_overlay and lane.left_line:
@@ -144,11 +151,7 @@ class HUDVisualizer:
         if self.show_objects:
             for obj in objects:
                 x1, y1, x2, y2 = obj.bbox
-                if obj.is_on_crosswalk:
-                    box_color = (0, 69, 255)  # High-visibility Red-Orange for pedestrians on crosswalk
-                    box_thickness = 3
-                    tag = f"CROSSWALK PED #{obj.track_id} {obj.confidence:.2f}"
-                elif obj.is_lead:
+                if obj.is_lead:
                     box_color = (0, 0, 255)  # Red for lead vehicle
                     box_thickness = 3
                     tag = f"LEAD CAR #{obj.track_id} [{obj.status}|{obj.relative_distance_trend}]"
@@ -209,11 +212,12 @@ class HUDVisualizer:
                         cv2.FONT_HERSHEY_DUPLEX, 0.55, (240, 240, 240), 1, cv2.LINE_AA)
             cv2.line(vis, (card_x + 10, card_y + 28), (card_x + card_w - 10, card_y + 28), (80, 80, 80), 1)
 
+            # 10월 30일 좌측 대시보드에 프레임 정보는 안보이게 변경 by 김유미
             # Frame & Timestamp & FPS
-            eff_fps = (1000.0 / timings.total_ms) if timings.total_ms > 0 else 0.0
-            info_str = f"F#{frame_idx:04d} | {timestamp_sec:.2f}s | {eff_fps:4.1f} FPS ({timings.total_ms:4.1f}ms)"
-            cv2.putText(vis, info_str, (card_x + 12, card_y + 46),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1, cv2.LINE_AA)
+            # eff_fps = (1000.0 / timings.total_ms) if timings.total_ms > 0 else 0.0
+            # info_str = f"F#{frame_idx:04d} | {timestamp_sec:.2f}s | {eff_fps:4.1f} FPS ({timings.total_ms:4.1f}ms)"
+            # cv2.putText(vis, info_str, (card_x + 12, card_y + 46),
+            #             cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1, cv2.LINE_AA)
 
             # Lead Vehicle State & Traffic Light
             lead_color = (255, 100, 100) if state.lead_state in ("STOPPED", "APPROACHING") else (180, 220, 180)
