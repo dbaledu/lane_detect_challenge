@@ -58,15 +58,41 @@ class LanesDetectorV1EMAdapter:
         self.crosswalk_detector = None
         self.prev_gray_roi = None
 
+        lane_cfg = cfg.get("lane", {})
+        self.use_undistort: bool = bool(lane_cfg.get("undistort", False))
+        calib_file: str = str(lane_cfg.get("calib_file", "config/camera_calib.npz"))
+        self.fov_deg: float = float(lane_cfg.get("undistort_fov_deg", 115.0))
+
+        # CheckerboardCalibrator 인스턴스 생성
+        self.calibrator = module.CheckerboardCalibrator(
+            calib_file=calib_file if os.path.exists(calib_file) else None
+        )
+        self._calib_initialized: bool = False  # 첫 프레임에서 lazy init
+
+        status_str = "ON" if self.use_undistort else "OFF"
+        print(f"[LanesDetectorV1EMAdapter] 렌즈 왜곡 보정: {status_str}")
+        if self.use_undistort and self.calibrator.is_calibrated:
+            print(f"[LanesDetectorV1EMAdapter] 기존 캘리브레이션 파일 로드 완료: {calib_file}")
+
     def detect(self, frame: np.ndarray, gray: np.ndarray = None,
                enhanced: np.ndarray = None, edges: np.ndarray = None):
         h, w = frame.shape[:2]
+        if self.use_undistort and not self._calib_initialized:
+            if not self.calibrator.is_calibrated:
+                print(f"[LanesDetectorV1EMAdapter] 캘리브레이션 파일 없음 → "
+                      f"내장 대시캠 광각 모델(FOV={self.fov_deg}°) 자동 적용")
+                self.calibrator.setup_default_dashcam_calibration((w, h), fov_deg=self.fov_deg)
+            self._calib_initialized = True
+
+        # use_undistort=True이면 calibrator 전달, OFF이면 None
+        calibrator_arg = self.calibrator if self.use_undistort else None
+
         if self.crosswalk_detector is None:
             self.crosswalk_detector = self.module.CrosswalkAndMotionDetector(w, h)
 
         _, status, gray_roi = self.module.process_frame(
             frame, self.tracker, self.crosswalk_detector, self.clahe,
-            self.prev_gray_roi, calibrator=None,
+            self.prev_gray_roi, calibrator=calibrator_arg,
             gray=gray, enhanced=enhanced, edge_map=edges
         )
         self.prev_gray_roi = gray_roi
@@ -140,6 +166,12 @@ def parse_args():
     parser.add_argument("--max-frames", type=int, help="Process only first N frames")
     parser.add_argument("--display", action="store_true", help="Display GUI playback window")
     parser.add_argument("--no-display", action="store_true", help="Disable GUI playback window")
+    # ── 렌즈 왜곡 보정 CLI 인자 ───────────────────────────────────────────────
+    parser.add_argument("--undistort", action="store_true", default=None,
+                        help="렌즈 왜곡 보정 ON (settings.yaml의 lane.undistort 덮어씀)")
+    parser.add_argument("--no-undistort", action="store_true", default=None,
+                        help="렌즈 왜곡 보정 OFF (settings.yaml의 lane.undistort 덮어씀)")
+    # ─────────────────────────────────────────────────────────────────────────
     return parser.parse_args()
 
 
@@ -162,6 +194,10 @@ def run_pipeline(cfg: dict, args: argparse.Namespace):
         cfg["visualization"]["display_window"] = True
     elif args.no_display:
         cfg["visualization"]["display_window"] = False
+    if args.undistort:
+        cfg.setdefault("lane", {})["undistort"] = True
+    elif args.no_undistort:
+        cfg.setdefault("lane", {})["undistort"] = False
 
     if args.output_dir:
         out_dir = Path(args.output_dir)
@@ -181,11 +217,13 @@ def run_pipeline(cfg: dict, args: argparse.Namespace):
     stride = int(v_cfg.get("frame_stride", 1))
     max_frames = int(v_cfg.get("max_frames", 0))
 
+    undistort_status = "ON" if cfg.get("lane", {}).get("undistort", False) else "OFF"
     print("=" * 65)
     print("  DASHCAM COMPUTER VISION ANALYSIS PIPELINE")
     print(f"  Input: {input_path}")
     print(f"  Output Video: {out_video_path}")
     print(f"  Target Width: {target_w} | Stride: {stride} | Detect Interval: {cfg['detector']['detect_interval']}")
+    print(f"  Lens Undistort: {undistort_status}")
     print("=" * 65)
 
     # 1. Initialize Video Reader
@@ -250,8 +288,6 @@ def run_pipeline(cfg: dict, args: argparse.Namespace):
             quality = quality_analyzer.analyze(frame, gray)
             t_preprocess = (time.perf_counter() - t0) * 1000.0
 
-            # First verify the stop over consecutive frames; only the confirmed
-            # state is allowed to skip lane/stopline detection in the next frame.
             freeze_stopped = stopped_confirmed
 
             # Lane + crosswalk detection and lane tracking
