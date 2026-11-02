@@ -87,7 +87,6 @@ class HUDVisualizer:
                 overlay = vis.copy()
             cv2.polylines(overlay, [roi_corners], isClosed=True, color=(70, 70, 70), thickness=1)
 
-
         # 2. Draw Driving Corridor & Lane Boundaries
         if self.show_lane_overlay and self.show_corridor and lane.left_line and lane.right_line and lane.status != "LOST":
             lx1, ly1, lx2, ly2 = lane.left_line
@@ -147,7 +146,7 @@ class HUDVisualizer:
                 cv2.putText(vis, "STOPLINE", (bx1, max(18, by1 - 6)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2, cv2.LINE_AA)
 
-        # 4. Draw Detected Objects
+        # 4. Draw Detected Objects (객체검출1027.py 색상 및 스타일 반영)
         if self.show_objects:
             for obj in objects:
                 x1, y1, x2, y2 = obj.bbox
@@ -159,15 +158,20 @@ class HUDVisualizer:
                     box_color = (0, 255, 255)  # Yellow for pedestrians
                     box_thickness = 2
                     tag = f"PED #{obj.track_id} {obj.confidence:.2f}"
+                elif obj.label == "traffic light":
+                    if state.traffic_light and state.traffic_light.detected:
+                        continue  # 4.1 신호등 전용 램프 색상으로 우선 렌더링
+                    box_color = (0, 255, 0)  # Green for traffic lights (객체검출1027 COLOR_LIGHT)
+                    box_thickness = 1
+                    tag = f"TL #{obj.track_id} {obj.confidence:.2f}"
                 else:
-                    box_color = (255, 180, 0)  # Cyan/Blue for other vehicles
-                    box_thickness = 2
+                    box_color = (0, 255, 255)  # Yellow for general objects (객체검출1027 COLOR_OBJECT)
+                    box_thickness = 1
                     tag = f"{obj.label} #{obj.track_id}"
 
                 cv2.rectangle(vis, (x1, y1), (x2, y2), box_color, box_thickness)
-                # 박태훈 10/23 수정. 객체 라벨 표시여부 제어(on/off) 
+                # 객체 라벨 표시 여부 제어(on/off)
                 if self.show_object_labels:
-                    # Label tag background
                     (tw, th), _ = cv2.getTextSize(tag, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
                     cv2.rectangle(vis, (x1, max(0, y1 - th - 6)), (x1 + tw + 6, max(th + 6, y1)), box_color, -1)
                     cv2.putText(vis, tag, (x1 + 3, max(th, y1 - 3)),
@@ -211,13 +215,6 @@ class HUDVisualizer:
             cv2.putText(vis, "DASHCAM VISION SYSTEM", (card_x + 12, card_y + 22),
                         cv2.FONT_HERSHEY_DUPLEX, 0.55, (240, 240, 240), 1, cv2.LINE_AA)
             cv2.line(vis, (card_x + 10, card_y + 28), (card_x + card_w - 10, card_y + 28), (80, 80, 80), 1)
-
-            # 10월 30일 좌측 대시보드에 프레임 정보는 안보이게 변경 by 김유미
-            # Frame & Timestamp & FPS
-            # eff_fps = (1000.0 / timings.total_ms) if timings.total_ms > 0 else 0.0
-            # info_str = f"F#{frame_idx:04d} | {timestamp_sec:.2f}s | {eff_fps:4.1f} FPS ({timings.total_ms:4.1f}ms)"
-            # cv2.putText(vis, info_str, (card_x + 12, card_y + 46),
-            #             cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1, cv2.LINE_AA)
 
             # Lead Vehicle State & Traffic Light
             lead_color = (255, 100, 100) if state.lead_state in ("STOPPED", "APPROACHING") else (180, 220, 180)

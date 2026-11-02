@@ -62,22 +62,35 @@ lane_change:
   candidate_frames: 4       # 변경 의심 진입 프레임수
   progress_frames: 10        # 변경 진행 판정 프레임수
 
-# 7. 객체 검출 모델 설정 (경량화 최적화)
+# 7. 객체 검출 모델 설정 (객체검출1027.py 경량 2-Path 최적화 반영)
 detector:
   enabled: true
-  backend: "auto"           # "ultralytics", "opencv_dnn", "none", "auto"
-  model_name: "yolo26n.pt"  # 경량 Nano 모델 (yolov8n.pt, yolo11n.pt)
-  confidence_threshold: 0.35
-  person_confidence_threshold: 0.22 # 횡단보도/도로 위 보행자 검출 전용 낮은 임계값
+  backend: "ultralytics"           # "ultralytics", "opencv_dnn", "none", "auto"
+  model_name: "yolo26n.pt"  # 경량 Nano 모델 (yolo26n.pt)
+  confidence_threshold: 0.22 # 객체검출1027.py 야간 최적 신뢰도
+  person_confidence_threshold: 0.22 # 보행자 신뢰도 임계값
   iou_threshold: 0.45
   detect_interval: 5        # N프레임마다 1회 추론 (중간 프레임은 트래커 보간)
   target_classes: [0, 1, 2, 3, 5, 7, 9] # person, bicycle, car, motorcycle, bus, truck, traffic light
+  hood_crop_ratio: 0.15     # 하단 본네트 영역 제거 비율 (15%)
+  enable_enhance: true      # 일반 객체용 야간 전처리 (감마 LUT + CLAHE)
+  imgsz_gpu: 640            # 일반 객체 GPU 해상도
+  imgsz_cpu: 480            # 일반 객체 CPU 해상도
+  # 신호등 전용 2-Path 설정 (객체검출1027.py)
+  tl_roi_ratio: 0.6         # 본네트 제외 높이의 상단 60%
+  tl_imgsz_gpu: 1280        # GPU 시 신호등 ROI 고해상도 입력
+  tl_imgsz_cpu: 640         # CPU 시 신호등 ROI 고해상도 입력
+  tl_conf: 0.10             # 신호등 전용 낮은 임계값 (후보 넓게 검출 후 검증)
+  tl_max_aspect: 5.0        # 박스 최대 종횡비 (넓은 건물 조명 제거)
+  tl_min_sat: 80            # 램프 최소 채도
+  tl_min_val: 140           # 램프 최소 명도
+  tl_min_lamp_ratio: 0.03   # 램프 픽셀 최소 비율
 
 # 8. 객체 추적기 설정 (Centroid & IoU 기반 경량 트래커)
 tracker:
-  max_distance_px: 85
-  max_missed_frames: 10
-  lead_vehicle_corridor_margin_px: 130 # 내 주행 차로 내 선행 차량 판별 여유폭
+  max_distance_px: 30
+  max_missed_frames: 4
+  lead_vehicle_corridor_margin_px: 100 # 내 주행 차로 내 선행 차량 판별 여유폭
 
 # 9. 횡단보도 및 정지선 검출 설정
 road_markings:
@@ -113,10 +126,10 @@ state:
 
 # 11. 시각화 (HUD) 설정
 visualization:
-  display_window: false     # 실시간 GUI 창 표시 여부 (헤드리스 환경에서는 false 권장)
+  display_window: false     # 실시간 GUI 창 표시 여부 (CLI --display로 활성화)
   show_lane_polygon: true   # 주행 영역 반투명 채우기
   show_center_path: true    # 주행 중심 경로선 표시
   show_hud_card: true       # 주행 상태 및 지표 대시보드 표시
-  show_debug_minimap: true  # 우측 상단 ROI 에지 미니맵 표시
-  show_objects: true       # 객체 검출 바운딩 박스 표시 여부
-  show_object_labels: true  # 객체 검출 바운딩 박스 라벨(태그 텍스트) 표시 여부
+  show_debug_minimap: false  # 우측 상단 ROI 에지 미니맵 표시
+  show_objects: true        # 객체 검출 바운딩 박스 표시 여부
+  show_object_labels: false  # 객체 검출 바운딩 박스 라벨(태그 텍스트) 표시 여부

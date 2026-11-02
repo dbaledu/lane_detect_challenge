@@ -217,6 +217,11 @@ def run_pipeline(cfg: dict, args: argparse.Namespace):
     stride = int(v_cfg.get("frame_stride", 1))
     max_frames = int(v_cfg.get("max_frames", 0))
 
+    # 1. Initialize Video Reader (지원되는 대체 경로 자동 탐색)
+    reader = VideoReader(input_path, target_width=target_w, frame_stride=stride)
+    input_path = reader.video_path
+    meta = reader.meta
+
     undistort_status = "ON" if cfg.get("lane", {}).get("undistort", False) else "OFF"
     print("=" * 65)
     print("  DASHCAM COMPUTER VISION ANALYSIS PIPELINE")
@@ -226,9 +231,6 @@ def run_pipeline(cfg: dict, args: argparse.Namespace):
     print(f"  Lens Undistort: {undistort_status}")
     print("=" * 65)
 
-    # 1. Initialize Video Reader
-    reader = VideoReader(input_path, target_width=target_w, frame_stride=stride)
-    meta = reader.meta
     print(f"[Video Info] Source: {meta.width}x{meta.height} @ {meta.fps:.2f} FPS | "
           f"Frames: {meta.frame_count} ({meta.duration_sec:.1f}s)")
     print(f"[Processing Size] {meta.target_width}x{meta.target_height}")
@@ -436,16 +438,19 @@ def run_pipeline(cfg: dict, args: argparse.Namespace):
             if display_active:
                 cv2.imshow("dashcam_cv", vis_frame)
                 key = cv2.waitKey(1 if not paused else 0) & 0xFF
-                if key == ord('q'):
+                if key in (ord('q'), 27):
                     print("[Pipeline] User requested quit.")
                     break
-                elif key == ord('p'):
+                elif key in (ord('p'), ord(' ')):
                     paused = not paused
                 elif key == ord('d'):
                     visualizer.show_debug_minimap = not visualizer.show_debug_minimap
                 elif key == ord('b'):
                     visualizer.show_bbox = not visualizer.show_bbox
-
+                elif key == ord('o'):
+                    visualizer.show_objects = not visualizer.show_objects
+                elif key == ord('l'):
+                    visualizer.show_object_labels = not visualizer.show_object_labels
 
     finally:
         reader.release()
