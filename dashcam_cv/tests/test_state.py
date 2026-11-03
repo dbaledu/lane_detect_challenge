@@ -255,6 +255,111 @@ class TestStateModule(unittest.TestCase):
         self.assertNotEqual(res.fusion_state, "STOP_REQUIRED")
 
 
+    def test_decision_fusion_lead_vehicle_stop_required(self):
+        """Tests that a lead vehicle within stopping distance triggers STOP_REQUIRED when ego is driving."""
+        fusion = DecisionFusion(self.cfg)
+        motion = MotionResult(magnitude=3.0, is_reliable=True)
+        lane = LaneResult(lane_center_x=480.0, lane_width_px=300.0, status="BOTH_DETECTED")
+        markings = RoadMarkingResult()
+
+        # Lead vehicle stopped in stopping distance (bottom y = 420 >= 540 * 0.75 = 405)
+        lead_car = ObjectBox(
+            track_id=2,
+            bbox=(430, 320, 530, 420),
+            class_id=2,
+            label="car",
+            confidence=0.95,
+            center=(480.0, 370.0),
+            is_lead=True,
+            status="STOPPED",
+            relative_distance_trend="APPROACHING"
+        )
+
+        res = fusion.evaluate(
+            motion=motion,
+            quality=self.quality_good,
+            lane=lane,
+            objects=[lead_car],
+            markings=markings,
+            lane_change_status="KEEPING",
+            frame_shape=(540, 960, 3)
+        )
+        self.assertEqual(res.fusion_state, "STOP_REQUIRED")
+        self.assertIn("선행 차량", res.reason)
+        self.assertIn("정지거리", res.reason)
+
+    def test_decision_fusion_lead_vehicle_far_stopped_slow_down(self):
+        """Tests that a lead vehicle stopped far away triggers SLOW_DOWN instead of STOP_REQUIRED."""
+        fusion = DecisionFusion(self.cfg)
+        motion = MotionResult(magnitude=3.0, is_reliable=True)
+        lane = LaneResult(lane_center_x=480.0, lane_width_px=300.0, status="BOTH_DETECTED")
+        markings = RoadMarkingResult()
+
+        # Lead vehicle stopped far away (bottom y = 350 < 405)
+        lead_car = ObjectBox(
+            track_id=3,
+            bbox=(450, 280, 510, 350),
+            class_id=2,
+            label="car",
+            confidence=0.90,
+            center=(480.0, 315.0),
+            is_lead=True,
+            status="STOPPED",
+            relative_distance_trend="STABLE"
+        )
+
+        res = None
+        for _ in range(3):
+            res = fusion.evaluate(
+                motion=motion,
+                quality=self.quality_good,
+                lane=lane,
+                objects=[lead_car],
+                markings=markings,
+                lane_change_status="KEEPING",
+                frame_shape=(540, 960, 3)
+            )
+
+        self.assertIsNotNone(res)
+        self.assertEqual(res.fusion_state, "SLOW_DOWN")
+        self.assertIn("접근 주의", res.reason)
+
+    def test_decision_fusion_lead_vehicle_ego_stopped(self):
+        """Tests that when ego vehicle stops behind a lead vehicle, state becomes STOPPED."""
+        fusion = DecisionFusion(self.cfg)
+        lane = LaneResult(lane_center_x=480.0, lane_width_px=300.0, status="BOTH_DETECTED")
+        markings = RoadMarkingResult()
+
+        lead_car = ObjectBox(
+            track_id=4,
+            bbox=(430, 320, 530, 420),
+            class_id=2,
+            label="car",
+            confidence=0.95,
+            center=(480.0, 370.0),
+            is_lead=True,
+            status="STOPPED",
+            relative_distance_trend="STABLE"
+        )
+
+        res = None
+        # Ego stopped (magnitude 0.2 < 0.85)
+        for _ in range(5):
+            res = fusion.evaluate(
+                motion=MotionResult(magnitude=0.2, is_reliable=True),
+                quality=self.quality_good,
+                lane=lane,
+                objects=[lead_car],
+                markings=markings,
+                lane_change_status="KEEPING",
+                frame_shape=(540, 960, 3)
+            )
+
+        self.assertIsNotNone(res)
+        self.assertEqual(res.ego_state, "STOPPED_SUSPECTED")
+        self.assertEqual(res.fusion_state, "STOPPED")
+
+
 if __name__ == "__main__":
     unittest.main()
 

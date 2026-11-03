@@ -25,6 +25,7 @@ class DecisionFusion:
         self.cfg = cfg or {}
         st_cfg = self.cfg.get("state", {})
         self.stopped_th = float(st_cfg.get("flow_stopped_threshold", 0.85))
+        self.lead_stop_ratio = float(st_cfg.get("lead_vehicle_stop_ratio", st_cfg.get("lead_stop_ratio", 0.75)))
 
         # Anti-flickering debounce and hold-time parameters
         self.state_hold_frames = int(st_cfg.get("state_hold_frames", 12))  # ~0.4s hold
@@ -317,6 +318,7 @@ class DecisionFusion:
 
         # 3. Extract Lead Vehicle and Pedestrian Dynamics
         lead_obj: Optional[ObjectBox] = None
+        lead_near_stop = False
         pedestrians_near = False
         pedestrians_mid = False
 
@@ -326,6 +328,8 @@ class DecisionFusion:
         for obj in objects:
             if obj.is_lead:
                 lead_obj = obj
+                if obj.bbox[3] >= (h * self.lead_stop_ratio):
+                    lead_near_stop = True
 
             if obj.label == "person":
                 cx, cy = obj.center
@@ -354,6 +358,11 @@ class DecisionFusion:
         if pedestrians_near:
             raw_state = "STOP_REQUIRED"
             raw_reason = "전방 차로 내 근접 보행자 감지 (즉시 정지 필요)"
+
+        # Hazard Priority 1.2: Lead vehicle within stopping distance while ego is moving/driving
+        elif lead_near_stop and (lead_state in ("STOPPED", "APPROACHING")) and ego_state != "STOPPED_SUSPECTED":
+            raw_state = "STOP_REQUIRED"
+            raw_reason = f"전방 선행 차량({lead_state}) 정지거리 내 근접 (충돌 방지 정지 필요)"
 
         # Hazard Priority 1.5: Traffic Light Red
         elif tl_result.detected and tl_result.color == "RED":
@@ -392,6 +401,9 @@ class DecisionFusion:
             if lead_state == "STOPPED" or lead_state == "APPROACHING":
                 raw_state = "SLOW_DOWN"
                 raw_reason = f"전방 선행 차량({lead_state}) 접근 주의 (감속 권고)"
+            elif lead_near_stop:
+                raw_state = "SLOW_DOWN"
+                raw_reason = "전방 선행 차량 근접 추종 (안전거리 확보 감속)"
             else:
                 raw_state = "NORMAL"
                 raw_reason = "정상 주행 흐름 유지"
