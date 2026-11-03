@@ -94,6 +94,8 @@ state:
   flow_start_threshold: 1.25 # 정지 후 재출발 판정 임계값
   window_size_frames: 25    # 상태 판별용 시계열 시간 창 (약 0.8초)
   stopped_persistence_frames: 15 # 정지 상태 확정 필요 최소 프레임수
+  # 선행 차량 정지거리 판단 설정
+  lead_vehicle_stop_ratio: 0.75 # 선행 차량 하단 Y(y2)가 화면 높이 대비 이 비율 이상이면 정지거리(STOP_REQUIRED) 판정
   # 깜빡임(Flickering) 방지 및 안정화 설정
   state_hold_frames: 12     # 경고/감속/정지 상태 전환 시 최소 유지 프레임수 (~0.4초)
   state_debounce_frames: 2  # 일시적 노이즈 차단을 위한 전환 확정 필요 연속 프레임수
