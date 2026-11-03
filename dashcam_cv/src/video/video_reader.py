@@ -1,4 +1,5 @@
 """Video Reader module for dashcam video decoding with metadata extraction."""
+import os
 import cv2
 import numpy as np
 from dataclasses import dataclass
@@ -21,6 +22,22 @@ class VideoReader:
     """Reads video files frame by frame with error resilience and accurate timing."""
 
     def __init__(self, video_path: str, target_width: int = 960, frame_stride: int = 1):
+        # 영상 경로가 없을 때 자동 대체 탐색 (C:/vision_work 등)
+        if not os.path.exists(video_path):
+            filename = os.path.basename(video_path)
+            candidates = [
+                os.path.join("C:/vision_work/video", filename),
+                os.path.join("C:/vision_work/images", filename),
+                os.path.join("C:/vision_work", filename),
+                os.path.join("images", filename),
+                os.path.join("../images", filename),
+            ]
+            for cand in candidates:
+                if os.path.exists(cand):
+                    print(f"[VideoReader] 입력 영상 '{video_path}'을(를) 찾을 수 없어 '{cand}'(으)로 자동 연결합니다.")
+                    video_path = cand
+                    break
+
         self.video_path = video_path
         self.target_width = target_width
         self.frame_stride = max(1, int(frame_stride))

@@ -15,7 +15,7 @@ import numpy as np
 # Ensure project root is on sys.path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.common.data_models import FrameTimings
+from src.common.data_models import FrameTimings, LaneResult, RoadMarkingResult
 from src.common.geometry import get_roi_polygon
 from src.common.visualizer import HUDVisualizer
 from src.video.video_reader import VideoReader
@@ -58,15 +58,41 @@ class LanesDetectorV1EMAdapter:
         self.crosswalk_detector = None
         self.prev_gray_roi = None
 
+        lane_cfg = cfg.get("lane", {})
+        self.use_undistort: bool = bool(lane_cfg.get("undistort", False))
+        calib_file: str = str(lane_cfg.get("calib_file", "config/camera_calib.npz"))
+        self.fov_deg: float = float(lane_cfg.get("undistort_fov_deg", 115.0))
+
+        # CheckerboardCalibrator 인스턴스 생성
+        self.calibrator = module.CheckerboardCalibrator(
+            calib_file=calib_file if os.path.exists(calib_file) else None
+        )
+        self._calib_initialized: bool = False  # 첫 프레임에서 lazy init
+
+        status_str = "ON" if self.use_undistort else "OFF"
+        print(f"[LanesDetectorV1EMAdapter] 렌즈 왜곡 보정: {status_str}")
+        if self.use_undistort and self.calibrator.is_calibrated:
+            print(f"[LanesDetectorV1EMAdapter] 기존 캘리브레이션 파일 로드 완료: {calib_file}")
+
     def detect(self, frame: np.ndarray, gray: np.ndarray = None,
                enhanced: np.ndarray = None, edges: np.ndarray = None):
         h, w = frame.shape[:2]
+        if self.use_undistort and not self._calib_initialized:
+            if not self.calibrator.is_calibrated:
+                print(f"[LanesDetectorV1EMAdapter] 캘리브레이션 파일 없음 → "
+                      f"내장 대시캠 광각 모델(FOV={self.fov_deg}°) 자동 적용")
+                self.calibrator.setup_default_dashcam_calibration((w, h), fov_deg=self.fov_deg)
+            self._calib_initialized = True
+
+        # use_undistort=True이면 calibrator 전달, OFF이면 None
+        calibrator_arg = self.calibrator if self.use_undistort else None
+
         if self.crosswalk_detector is None:
             self.crosswalk_detector = self.module.CrosswalkAndMotionDetector(w, h)
 
         _, status, gray_roi = self.module.process_frame(
             frame, self.tracker, self.crosswalk_detector, self.clahe,
-            self.prev_gray_roi, calibrator=None,
+            self.prev_gray_roi, calibrator=calibrator_arg,
             gray=gray, enhanced=enhanced, edge_map=edges
         )
         self.prev_gray_roi = gray_roi
@@ -140,6 +166,12 @@ def parse_args():
     parser.add_argument("--max-frames", type=int, help="Process only first N frames")
     parser.add_argument("--display", action="store_true", help="Display GUI playback window")
     parser.add_argument("--no-display", action="store_true", help="Disable GUI playback window")
+    # ── 렌즈 왜곡 보정 CLI 인자 ───────────────────────────────────────────────
+    parser.add_argument("--undistort", action="store_true", default=None,
+                        help="렌즈 왜곡 보정 ON (settings.yaml의 lane.undistort 덮어씀)")
+    parser.add_argument("--no-undistort", action="store_true", default=None,
+                        help="렌즈 왜곡 보정 OFF (settings.yaml의 lane.undistort 덮어씀)")
+    # ─────────────────────────────────────────────────────────────────────────
     return parser.parse_args()
 
 
@@ -162,6 +194,10 @@ def run_pipeline(cfg: dict, args: argparse.Namespace):
         cfg["visualization"]["display_window"] = True
     elif args.no_display:
         cfg["visualization"]["display_window"] = False
+    if args.undistort:
+        cfg.setdefault("lane", {})["undistort"] = True
+    elif args.no_undistort:
+        cfg.setdefault("lane", {})["undistort"] = False
 
     if args.output_dir:
         out_dir = Path(args.output_dir)
@@ -181,16 +217,20 @@ def run_pipeline(cfg: dict, args: argparse.Namespace):
     stride = int(v_cfg.get("frame_stride", 1))
     max_frames = int(v_cfg.get("max_frames", 0))
 
+    # 1. Initialize Video Reader (지원되는 대체 경로 자동 탐색)
+    reader = VideoReader(input_path, target_width=target_w, frame_stride=stride)
+    input_path = reader.video_path
+    meta = reader.meta
+
+    undistort_status = "ON" if cfg.get("lane", {}).get("undistort", False) else "OFF"
     print("=" * 65)
     print("  DASHCAM COMPUTER VISION ANALYSIS PIPELINE")
     print(f"  Input: {input_path}")
     print(f"  Output Video: {out_video_path}")
     print(f"  Target Width: {target_w} | Stride: {stride} | Detect Interval: {cfg['detector']['detect_interval']}")
+    print(f"  Lens Undistort: {undistort_status}")
     print("=" * 65)
 
-    # 1. Initialize Video Reader
-    reader = VideoReader(input_path, target_width=target_w, frame_stride=stride)
-    meta = reader.meta
     print(f"[Video Info] Source: {meta.width}x{meta.height} @ {meta.fps:.2f} FPS | "
           f"Frames: {meta.frame_count} ({meta.duration_sec:.1f}s)")
     print(f"[Processing Size] {meta.target_width}x{meta.target_height}")
@@ -232,6 +272,10 @@ def run_pipeline(cfg: dict, args: argparse.Namespace):
 
     display_active = cfg.get("visualization", {}).get("display_window", False)
     paused = False
+    previous_ego_state = "UNCERTAIN"
+    stopped_confirm_frames = max(1, int(cfg.get("state", {}).get("stopped_persistence_frames", 3)))
+    stopped_candidate_count = 0
+    stopped_confirmed = False
 
     try:
         for ok, frame, frame_idx, timestamp in reader.frames(max_frames=max_frames):
@@ -246,38 +290,52 @@ def run_pipeline(cfg: dict, args: argparse.Namespace):
             quality = quality_analyzer.analyze(frame, gray)
             t_preprocess = (time.perf_counter() - t0) * 1000.0
 
+            freeze_stopped = stopped_confirmed
+
             # Lane + crosswalk detection and lane tracking
             t0 = time.perf_counter()
-            if lane_detector_name == "lanes_detector_v1_em":
-                curr_left_fit, curr_right_fit, is_crosswalk, lane_debug = lane_detector.detect(
-                    frame, gray=gray, enhanced=enhanced, edges=edges
+            curr_left_fit = None
+            curr_right_fit = None
+            is_crosswalk = False
+            lane_debug = {}
+
+            if not freeze_stopped:
+                if lane_detector_name == "lanes_detector_v1_em":
+                    curr_left_fit, curr_right_fit, is_crosswalk, lane_debug = lane_detector.detect(
+                        frame, gray=gray, enhanced=enhanced, edges=edges
+                    )
+                else:
+                    curr_left_fit, curr_right_fit, is_crosswalk, lane_debug = lane_detector.detect(frame)
+
+                lane_res = lane_tracker.update(
+                    curr_left_fit=curr_left_fit,
+                    curr_right_fit=curr_right_fit,
+                    raw_confidence=lane_debug.get("confidence", 0.0),
+                    w=meta.target_width,
+                    h=meta.target_height,
+                    is_crosswalk=is_crosswalk,
+                    debug_info=lane_debug,
                 )
             else:
-                curr_left_fit, curr_right_fit, is_crosswalk, lane_debug = lane_detector.detect(frame)
-            lane_res = lane_tracker.update(
-                curr_left_fit=curr_left_fit,
-                curr_right_fit=curr_right_fit,
-                raw_confidence=lane_debug.get("confidence", 0.0),
-                w=meta.target_width,
-                h=meta.target_height,
-                is_crosswalk=is_crosswalk,
-                debug_info=lane_debug,
-            )
+                lane_res = LaneResult(status="STOPPED_SKIPPED", is_uncertain=True)
+
             lane_change_st = lane_change_detector.update(lane_res)
             t_lane = (time.perf_counter() - t0) * 1000.0
 
             # Road Markings (Crosswalks and Stop lines)
             t0 = time.perf_counter()
-            # 횡단보도는 선택된 차선 모듈이 담당하며, 노면 모듈은 정지선만 담당합니다.
-            lane_cw_boxes = lane_debug.get("cw_boxes", []) if is_crosswalk else []
-            markings_res = road_markings.detect(
-                frame,
-                enhanced,
-                edges,
-                crosswalk_boxes=lane_cw_boxes,
-            )
-            markings_res.crosswalk_detected = bool(is_crosswalk)
-            markings_res.crosswalk_boxes = lane_cw_boxes
+            if freeze_stopped:
+                road_markings.reset_stopline_state()
+                markings_res = RoadMarkingResult()
+            else:
+                # 횡단보도는 선택된 차선 모듈이 담당하며, 노면 모듈은 정지선만 담당합니다.
+                lane_cw_boxes = lane_debug.get("cw_boxes", []) if is_crosswalk else []
+                markings_res = road_markings.detect(
+                    frame,
+                    enhanced,
+                    edges,
+                    crosswalk_boxes=lane_cw_boxes,
+                )
             t_markings = (time.perf_counter() - t0) * 1000.0
 
             # Object Detection
@@ -302,6 +360,18 @@ def run_pipeline(cfg: dict, args: argparse.Namespace):
             state_res = decision_fusion.evaluate(
                 motion_res, quality, lane_res, tracked_objects, markings_res, lane_change_st, frame.shape, frame=frame
             )
+            previous_ego_state = state_res.ego_state
+
+            if state_res.ego_state == "NORMAL_DRIVING":
+                stopped_candidate_count = 0
+                stopped_confirmed = False
+            elif state_res.ego_state == "STOPPED_SUSPECTED":
+                stopped_candidate_count += 1
+                if stopped_candidate_count >= stopped_confirm_frames:
+                    stopped_confirmed = True
+            elif state_res.ego_state == "UNCERTAIN" and not stopped_confirmed:
+                stopped_candidate_count = 0
+
             t_decision = (time.perf_counter() - t0) * 1000.0
 
             # HUD Visualization Overlay
@@ -368,16 +438,19 @@ def run_pipeline(cfg: dict, args: argparse.Namespace):
             if display_active:
                 cv2.imshow("dashcam_cv", vis_frame)
                 key = cv2.waitKey(1 if not paused else 0) & 0xFF
-                if key == ord('q'):
+                if key in (ord('q'), 27):
                     print("[Pipeline] User requested quit.")
                     break
-                elif key == ord('p'):
+                elif key in (ord('p'), ord(' ')):
                     paused = not paused
                 elif key == ord('d'):
                     visualizer.show_debug_minimap = not visualizer.show_debug_minimap
                 elif key == ord('b'):
                     visualizer.show_bbox = not visualizer.show_bbox
-
+                elif key == ord('o'):
+                    visualizer.show_objects = not visualizer.show_objects
+                elif key == ord('l'):
+                    visualizer.show_object_labels = not visualizer.show_object_labels
 
     finally:
         reader.release()

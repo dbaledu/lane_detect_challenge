@@ -2,6 +2,7 @@
 import cv2
 import numpy as np
 from typing import Optional, List, Tuple, Dict, Any
+from collections import deque
 from ..common.data_models import MotionResult, ObjectBox
 
 
@@ -17,6 +18,8 @@ class MotionEstimator:
         self.prev_pts: Optional[np.ndarray] = None
         self.frame_count: int = 0
         self.reseed_interval: int = int(st_cfg.get("flow_reseed_interval", 20))
+        self.motion_window_size = max(1, int(st_cfg.get("motion_window_size_frames", 5)))
+        self.motion_history: deque = deque(maxlen=self.motion_window_size)
 
         # Lucas-Kanade optical flow parameters
         self.lk_params = dict(
@@ -64,7 +67,8 @@ class MotionEstimator:
             mask = self._create_feature_mask(h, w, detected_objects)
             self.prev_pts = cv2.goodFeaturesToTrack(gray, mask=mask, **self.feature_params)
             self.prev_gray = gray
-            return MotionResult(magnitude=0.0, median_dx=0.0, median_dy=0.0, tracked_points=0, is_reliable=True)
+            self.motion_history.clear()
+            return MotionResult(magnitude=0.0, median_dx=0.0, median_dy=0.0, tracked_points=0, is_reliable=False)
 
         # 2. Pure PyrLK optical flow tracking without full-mask allocation overhead
         curr_pts, status, _ = cv2.calcOpticalFlowPyrLK(
@@ -97,26 +101,60 @@ class MotionEstimator:
         if len(good_curr) < 10:
             self.prev_gray = gray
             self.prev_pts = None
+            self.motion_history.clear()
             return MotionResult(magnitude=0.0, median_dx=0.0, median_dy=0.0, tracked_points=len(good_curr), is_reliable=False)
 
-        # 4. Vectorized displacement calculation without temporary slicing copies
+        # 4. Robust vector statistics: reject isolated foreground-like motion and camera-noise vectors
         diff = good_curr[:, 0, :] - good_prev[:, 0, :]
         dx = diff[:, 0]
         dy = diff[:, 1]
-        mags = np.hypot(dx, dy)
 
-        # Median statistics against rogue outliers
+        med_dx = float(np.median(dx))
+        med_dy = float(np.median(dy))
+
+        residual_dx = np.abs(dx - med_dx)
+        residual_dy = np.abs(dy - med_dy)
+        mad_dx = float(np.median(residual_dx))
+        mad_dy = float(np.median(residual_dy))
+        vector_residual = np.hypot(residual_dx, residual_dy)
+        residual_limit = max(0.75, 2.5 * float(np.median(vector_residual)))
+
+        inlier_mask = vector_residual <= residual_limit
+        inlier_count = int(np.count_nonzero(inlier_mask))
+        inlier_ratio = inlier_count / float(len(good_curr))
+
+        if inlier_count < 10 or inlier_ratio < 0.55:
+            self.prev_gray = gray
+            self.prev_pts = good_curr.reshape(-1, 1, 2)
+            self.motion_history.clear()
+            return MotionResult(
+                magnitude=0.0,
+                median_dx=med_dx,
+                median_dy=med_dy,
+                tracked_points=inlier_count,
+                is_reliable=False,
+            )
+
+        dx = dx[inlier_mask]
+        dy = dy[inlier_mask]
+        mags = np.hypot(dx, dy)
         med_dx = float(np.median(dx))
         med_dy = float(np.median(dy))
         med_mag = float(np.median(mags))
 
+        # Temporal median prevents a single static/blurry frame or camera shake from becoming a stop/move decision.
+        self.motion_history.append(med_mag)
+        smoothed_mag = float(np.median(np.asarray(self.motion_history, dtype=np.float32)))
+        med_mag = smoothed_mag
+
         # 5. Periodic replenishment gated by frame interval to avoid infinite re-detection loop
-        if len(good_curr) < int(self.max_features * 0.45) and (self.frame_count % self.reseed_interval == 0):
+        inlier_curr = good_curr[inlier_mask]
+        if inlier_count < int(self.max_features * 0.45) and (self.frame_count % self.reseed_interval == 0):
             mask = self._create_feature_mask(h, w, detected_objects)
             new_features = cv2.goodFeaturesToTrack(gray, mask=mask, **self.feature_params)
-            self.prev_pts = new_features if new_features is not None else good_curr.reshape(-1, 1, 2)
+            self.prev_pts = new_features if new_features is not None else inlier_curr.reshape(-1, 1, 2)
         else:
-            self.prev_pts = good_curr.reshape(-1, 1, 2)
+            self.prev_pts = inlier_curr.reshape(-1, 1, 2)
 
         self.prev_gray = gray
 
@@ -124,6 +162,6 @@ class MotionEstimator:
             magnitude=med_mag,
             median_dx=med_dx,
             median_dy=med_dy,
-            tracked_points=len(good_curr),
+            tracked_points=inlier_count,
             is_reliable=True
         )

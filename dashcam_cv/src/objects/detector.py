@@ -1,4 +1,4 @@
-"""Lightweight Object Detector module with YOLO backend, night enhancement, and hood crop."""
+"""Lightweight Object Detector module with YOLO backend, night enhancement, and 2-path traffic light verification (객체검출1027.py 기반)."""
 import os
 import cv2
 import numpy as np
@@ -31,7 +31,7 @@ class _DropHalfWarning(logging.Filter):
 
 
 def pick_device() -> str:
-    """RTX 5060(sm_120) 등 아키텍처 호환성 및 CUDA 가용성을 검사하여 디바이스 반환."""
+    """RTX 5060(sm_120) 등 아키텍처 호환성 및 CUDA 가용성을 검사하여 디바이스 반환 (객체검출1027.py)."""
     if torch is None or not torch.cuda.is_available():
         return "cpu"
 
@@ -67,9 +67,17 @@ class NightEnhancer:
 
 
 class SubDetector:
-    """단일 YOLO 모델을 감싸며 워밍업 및 FP16 추론을 수행하는 서브 검출기."""
+    """단일 YOLO 모델을 감싸며 워밍업 및 FP16 추론을 수행하는 서브 검출기 (일반 객체 및 신호등 공유)."""
 
-    def __init__(self, weight: str, device: str, imgsz: int, classes: Optional[List[int]], conf: float, id_map: Optional[Dict[int, int]] = None):
+    def __init__(
+        self,
+        weight: str,
+        device: str,
+        imgsz: int = 640,
+        classes: Optional[List[int]] = None,
+        conf: float = 0.22,
+        id_map: Optional[Dict[int, int]] = None,
+    ):
         from ultralytics import YOLO
 
         self.weight = weight
@@ -78,34 +86,55 @@ class SubDetector:
         self.classes = classes
         self.conf = conf
         self.id_map = id_map or {}
-        self.precision_kwargs = {}
+        self.half = False
 
         logging.getLogger("ultralytics").addFilter(_DropHalfWarning())
         self.model = YOLO(weight)
         self.names = self.model.names
 
-    def warmup(self, img: np.ndarray, n: int = 2):
-        """첫 번째 프레임 추론 시 GPU 메모리 할당 및 FP16 초기화 지연 방지."""
+    def warmup(
+        self,
+        warm_img: np.ndarray,
+        imgsz: int = 640,
+        tl_imgsz: int = 640,
+        tl_roi: Optional[np.ndarray] = None,
+    ):
+        """첫 번째 프레임 추론 시 GPU 메모리 할당 및 FP16 초기화 지연 방지 (객체검출1027.py)."""
         if self.device == "cuda":
+            self.half = True
             try:
-                self.precision_kwargs = {"half": True}
-                self.predict(img)
+                self.predict(warm_img, imgsz=imgsz, classes=[0, 1, 2, 3, 5, 7], conf=0.22)
             except Exception:
-                self.precision_kwargs = {}
-        for _ in range(n):
-            self.predict(img)
+                self.half = False
 
-    def predict(self, img: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """단일 이미지에 대해 YOLO 검출 수행."""
+        for _ in range(2):
+            self.predict(warm_img, imgsz=imgsz, classes=[0, 1, 2, 3, 5, 7], conf=0.22)
+            if tl_roi is not None and tl_roi.size > 0:
+                self.predict(tl_roi, imgsz=tl_imgsz, classes=[9], conf=0.10)
+
+    def predict(
+        self,
+        img: np.ndarray,
+        imgsz: Optional[int] = None,
+        classes: Optional[List[int]] = None,
+        conf: Optional[float] = None,
+        iou: float = 0.45,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """단일 이미지에 대해 YOLO 검출 수행 (FP16 최적화 지원)."""
+        use_imgsz = imgsz or self.imgsz
+        use_classes = classes if classes is not None else self.classes
+        use_conf = conf if conf is not None else self.conf
+
         r = self.model.predict(
             source=img,
-            imgsz=self.imgsz,
-            conf=self.conf,
-            classes=self.classes,
+            imgsz=use_imgsz,
+            conf=use_conf,
+            iou=iou,
+            classes=use_classes,
             device=self.device,
             max_det=100,
             verbose=False,
-            **(self.precision_kwargs or {}),
+            **({"half": True} if self.half else {}),
         )[0]
 
         b = r.boxes
@@ -120,7 +149,7 @@ class SubDetector:
 
 
 class ObjectDetector:
-    """차량, 보행자, 신호등 및 횡단보도를 검출하는 고속 경량 객체 검출기."""
+    """차량, 보행자, 신호등을 검출하는 고속 경량 2-Path 객체 검출기 (객체검출1027.py 기반)."""
 
     def __init__(self, cfg: Optional[Dict[str, Any]] = None):
         self.cfg = cfg or {}
@@ -129,22 +158,41 @@ class ObjectDetector:
         self.enabled = det_cfg.get("enabled", True)
         self.backend = det_cfg.get("backend", "auto")
         self.model_name = det_cfg.get("model_name", "yolo26n.pt")
-        self.conf_th = float(det_cfg.get("confidence_threshold", 0.35))
+        self.conf_th = float(det_cfg.get("confidence_threshold", 0.22))
         self.person_conf_th = float(det_cfg.get("person_confidence_threshold", 0.22))
         self.iou_th = float(det_cfg.get("iou_threshold", 0.45))
         self.interval = max(1, int(det_cfg.get("detect_interval", 5)))
         self.target_classes = list(det_cfg.get("target_classes", [0, 1, 2, 3, 5, 7, 9]))
 
-        # object_th_1022.py 고속/야간 최적화 설정
+        # 일반 객체 클래스와 신호등 클래스 분리 (객체검출1027.py)
+        self.general_classes = [c for c in self.target_classes if c != 9]
+        if not self.general_classes:
+            self.general_classes = [0, 1, 2, 3, 5, 7]
+        self.has_tl = 9 in self.target_classes
+        self.tl_class = 9
+
+        # 본네트 및 야간 전처리 (감마 LUT + CLAHE)
         self.hood_crop_ratio = float(det_cfg.get("hood_crop_ratio", 0.15))
         self.enable_enhance = det_cfg.get("enable_enhance", True)
         self.imgsz_gpu = int(det_cfg.get("imgsz_gpu", 640))
         self.imgsz_cpu = int(det_cfg.get("imgsz_cpu", 480))
 
+        # 신호등 전용 설정 (객체검출1027.py)
+        self.tl_roi_ratio = float(det_cfg.get("tl_roi_ratio", 0.6))
+        self.tl_imgsz_gpu = int(det_cfg.get("tl_imgsz_gpu", 1280))
+        self.tl_imgsz_cpu = int(det_cfg.get("tl_imgsz_cpu", 640))
+        self.tl_conf = float(det_cfg.get("tl_conf", 0.10))
+        self.tl_max_aspect = float(det_cfg.get("tl_max_aspect", 5.0))
+        self.tl_min_sat = int(det_cfg.get("tl_min_sat", 80))
+        self.tl_min_val = int(det_cfg.get("tl_min_val", 140))
+        self.tl_min_lamp_ratio = float(det_cfg.get("tl_min_lamp_ratio", 0.03))
+
+        self.sub_detector: Optional[SubDetector] = None
         self.detectors: List[SubDetector] = []
         self.enhancer: Optional[NightEnhancer] = None
         self.device = "cpu"
         self.imgsz = self.imgsz_cpu
+        self.tl_imgsz = self.tl_imgsz_cpu
         self._warmed_up = False
         self.cached_boxes: List[ObjectBox] = []
 
@@ -162,25 +210,27 @@ class ObjectDetector:
                 if self.device == "cuda" and torch is not None:
                     torch.backends.cudnn.benchmark = True
                     self.imgsz = self.imgsz_gpu
+                    self.tl_imgsz = self.tl_imgsz_gpu
                 else:
                     if torch is not None:
                         torch.set_num_threads(os.cpu_count() or 4)
                     self.imgsz = self.imgsz_cpu
+                    self.tl_imgsz = self.tl_imgsz_cpu
 
-                # 1. 메인 COCO 검출기 생성
-                main_det = SubDetector(
+                # 단일 YOLO 모델 인스턴스 (두 경로 공유)
+                self.sub_detector = SubDetector(
                     weight=self.model_name,
                     device=self.device,
-                    imgsz=self.imgsz,
-                    classes=self.target_classes,
-                    conf=min(self.conf_th, self.person_conf_th),
                 )
-                self.detectors.append(main_det)
-                print(f"[ObjectDetector] 메인 YOLO 모델 로드 성공: {self.model_name} (device={self.device}, imgsz={self.imgsz})")
+                self.detectors = [self.sub_detector]
+                print(
+                    f"[ObjectDetector] 객체검출1027 듀얼경로 YOLO 로드 성공: {self.model_name} | "
+                    f"device={self.device.upper()} | imgsz={self.imgsz} | tl_imgsz={self.tl_imgsz}"
+                )
 
-                # 2. 야간 전처리기 생성
+                # 2. 야간 전처리기 생성 (L채널 감마 + CLAHE)
                 if self.enable_enhance:
-                    self.enhancer = NightEnhancer()
+                    self.enhancer = NightEnhancer(clip_limit=2.0, tile_grid_size=(8, 8), gamma=0.8)
 
                 self.backend = "ultralytics"
                 return
@@ -199,7 +249,7 @@ class ObjectDetector:
         if not should_run:
             return self.cached_boxes, False
 
-        if self.backend == "ultralytics" and self.detectors:
+        if self.backend == "ultralytics" and self.sub_detector is not None:
             boxes = self._detect_yolo(frame)
         else:
             boxes = self._detect_opencv_fallback(frame)
@@ -207,39 +257,114 @@ class ObjectDetector:
         self.cached_boxes = boxes
         return boxes, True
 
+    def _verify_traffic_lights(
+        self,
+        roi: np.ndarray,
+        xyxy: np.ndarray,
+        ids: np.ndarray,
+        confs: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """건물 조명 오검출 제거: 박스 종횡비 + 박스 내 적/황/녹색 램프 픽셀 비율 검증 (객체검출1027.py)."""
+        if len(ids) == 0:
+            return np.empty((0, 4), np.float32), np.empty(0, int), np.empty(0, np.float32)
+
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        lit = (
+            cv2.inRange(hsv, (0, self.tl_min_sat, self.tl_min_val), (12, 255, 255))        # 적색 1
+            | cv2.inRange(hsv, (18, self.tl_min_sat, self.tl_min_val), (95, 255, 255))     # 황색~녹색
+            | cv2.inRange(hsv, (165, self.tl_min_sat, self.tl_min_val), (180, 255, 255))   # 적색 2
+        )
+
+        keep = []
+        for i, (x1, y1, x2, y2) in enumerate(xyxy.astype(int)):
+            w_box, h_box = x2 - x1, y2 - y1
+            if min(w_box, h_box) < 1 or max(w_box, h_box) > self.tl_max_aspect * min(w_box, h_box):
+                continue
+            y1_c = max(0, min(roi.shape[0], y1))
+            y2_c = max(0, min(roi.shape[0], y2))
+            x1_c = max(0, min(roi.shape[1], x1))
+            x2_c = max(0, min(roi.shape[1], x2))
+            if y2_c <= y1_c or x2_c <= x1_c:
+                continue
+            # 유효 램프 픽셀 수 검사
+            lamp_pixels = cv2.countNonZero(lit[y1_c:y2_c, x1_c:x2_c])
+            if lamp_pixels >= max(2, self.tl_min_lamp_ratio * w_box * h_box):
+                keep.append(i)
+
+        if not keep:
+            return np.empty((0, 4), np.float32), np.empty(0, int), np.empty(0, np.float32)
+
+        keep = np.array(keep, dtype=int)
+        return xyxy[keep], ids[keep], confs[keep]
+
     def _detect_yolo(self, frame: np.ndarray) -> List[ObjectBox]:
-        """본네트 제거, 해상도 축소, 야간 보정을 거친 고속 다중 YOLO 추론."""
+        """객체검출1027.py 기반 듀얼 경로(일반 객체 + 신호등) 고속 추론 및 오검출 검증."""
         h, w = frame.shape[:2]
+
+        if self.sub_detector is None:
+            return []
 
         # 1. 본네트 하단 영역 제외 (오검출 방지 및 연산 절약)
         crop_h = int(h * (1.0 - self.hood_crop_ratio))
-        cropped = frame[:crop_h]
+        crop = frame[:crop_h]
 
-        # 2. 추론 해상도로 축소
-        scale = self.imgsz / max(w, crop_h)
-        small_w = max(1, round(w * scale))
-        small_h = max(1, round(crop_h * scale))
-        small = cv2.resize(cropped, (small_w, small_h), interpolation=cv2.INTER_AREA)
+        # 일반 객체용 축소 스케일 및 크기 계산
+        g_scale = self.imgsz / max(w, crop_h)
+        g_size = (max(1, round(w * g_scale)), max(1, round(crop_h * g_scale)))
+        g_k = np.array([w / g_size[0], crop_h / g_size[1]] * 2, np.float32)
 
-        # 3. 첫 프레임 예열 (Warmup)
+        # 신호등용 상단 ROI 및 크기 계산
+        roi_h = max(1, int(crop_h * self.tl_roi_ratio))
+        t_scale = min(1.0, self.tl_imgsz / max(w, roi_h))
+        t_size = (max(1, round(w * t_scale)), max(1, round(roi_h * t_scale)))
+        t_k = np.array([w / t_size[0], roi_h / t_size[1]] * 2, np.float32)
+        tl_target_sz = int(np.ceil(max(t_size) / 32) * 32)
+
+        # 2. 첫 프레임 예열 (Warmup)
         if not self._warmed_up:
-            warm_img = self.enhancer(small) if self.enhancer is not None else small
-            for det in self.detectors:
-                det.warmup(warm_img)
+            small_warm = cv2.resize(crop, g_size, interpolation=cv2.INTER_AREA)
+            if self.enhancer is not None:
+                small_warm = self.enhancer(small_warm)
+            roi_warm = cv2.resize(crop[:roi_h], t_size, interpolation=cv2.INTER_AREA)
+            self.sub_detector.warmup(small_warm, imgsz=self.imgsz, tl_imgsz=tl_target_sz, tl_roi=roi_warm)
             self._warmed_up = True
 
-        # 4. 야간 전처리
+        all_xyxy = []
+        all_ids = []
+        all_confs = []
+
+        # 3. 경로 1) 일반 객체: 축소 + 야간 전처리 (CLAHE + 감마 LUT)
+        small = cv2.resize(crop, g_size, interpolation=cv2.INTER_AREA)
         if self.enhancer is not None:
             small = self.enhancer(small)
 
-        # 5. 서브 검출기 추론 수행
-        all_xyxy, all_ids, all_confs = [], [], []
-        for det in self.detectors:
-            xyxy, cls_ids, confs = det.predict(small)
-            if len(cls_ids):
-                all_xyxy.append(xyxy)
-                all_ids.append(cls_ids)
-                all_confs.append(confs)
+        g_xyxy, g_ids, g_confs = self.sub_detector.predict(
+            small,
+            imgsz=self.imgsz,
+            classes=self.general_classes,
+            conf=self.conf_th,
+            iou=self.iou_th
+        )
+        if len(g_ids):
+            all_xyxy.append(g_xyxy * g_k)
+            all_ids.append(g_ids)
+            all_confs.append(g_confs)
+
+        # 4. 경로 2) 신호등: 상단 ROI, 전처리 없이 고해상도 검출 후 검증
+        if self.has_tl:
+            roi = cv2.resize(crop[:roi_h], t_size, interpolation=cv2.INTER_AREA)
+            t_xyxy, t_ids, t_confs = self.sub_detector.predict(
+                roi,
+                imgsz=tl_target_sz,
+                classes=[self.tl_class],
+                conf=self.tl_conf,
+                iou=self.iou_th
+            )
+            t_xyxy, t_ids, t_confs = self._verify_traffic_lights(roi, t_xyxy, t_ids, t_confs)
+            if len(t_ids):
+                all_xyxy.append(t_xyxy * t_k)
+                all_ids.append(t_ids)
+                all_confs.append(t_confs)
 
         if not all_xyxy:
             return []
@@ -248,24 +373,24 @@ class ObjectDetector:
         cat_ids = np.concatenate(all_ids)
         cat_confs = np.concatenate(all_confs)
 
-        # 6. 원본 좌표계로 스케일 복원
-        inv_scale = 1.0 / scale
+        # 5. ObjectBox 생성
         boxes: List[ObjectBox] = []
-
         for i in range(len(cat_xyxy)):
             cls_id = int(cat_ids[i])
             score = float(cat_confs[i])
 
-            # 보행자 저조도 민감도 분기
-            min_score = self.person_conf_th if cls_id == 0 else self.conf_th
+            min_score = self.person_conf_th if cls_id == 0 else (self.tl_conf if cls_id == 9 else self.conf_th)
             if score < min_score:
                 continue
 
-            x1, y1, x2, y2 = cat_xyxy[i] * inv_scale
+            x1, y1, x2, y2 = cat_xyxy[i]
             x1 = max(0, min(w - 1, int(round(x1))))
             y1 = max(0, min(crop_h - 1, int(round(y1))))
             x2 = max(0, min(w - 1, int(round(x2))))
             y2 = max(0, min(crop_h - 1, int(round(y2))))
+
+            if x2 <= x1 or y2 <= y1:
+                continue
 
             cx = (x1 + x2) / 2.0
             cy = (y1 + y2) / 2.0
